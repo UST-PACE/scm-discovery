@@ -1,0 +1,38 @@
+[project]
+name = "gitlab-discovery"
+version = "0.1.0"
+description = "CLI to audit GitLab SaaS groups/users for migration planning to GHEC"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Pace Migration Tooling" }]
+dependencies = [
+    "httpx>=0.27.0",
+    "typer>=0.12.5",
+    "rich>=13.7.1",
+    "pydantic>=2.8.2"
+]
+
+[project.scripts]
+gitlab-discovery = "gitlab_discovery.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gitlab_discovery"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/gitlab_discovery", "README.md", "pyproject.toml"]
+
+[tool.uv]
+package = true
+dev-dependencies = [
+    "pytest>=8.2",
+    "respx>=0.21.1",
+    "anyio>=4.4"
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
