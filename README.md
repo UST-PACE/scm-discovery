@@ -7,9 +7,12 @@ CLI to inventory GitLab SaaS groups, subgroups, and members for migration prep.
 - Create and populate `.env`:
   - `GITLAB_TOKEN=` GitLab PAT with `read_api` (group Owner recommended).
   - `GITLAB_BASE_URL=https://gitlab.com` (change if self-managed, e.g., `https://gitlab.ustpace.com/`).
-  - `GITLAB_ROOT_GROUP=` group ID or full path to start recursion (leave blank to auto-use your only top-level group).
-  - `OUTPUT_DIR=reports`
+  - `GITLAB_ROOT_GROUP=` group ID or full path to start recursion (leave blank to audit every accessible top-level group).
+  - `OUTPUT_DIR=output`
   - `INCLUDE_EMAILS=false` (set to true if you have admin to fetch emails).
+  - `GITLAB_DISCOVERY_LOG_LEVEL=INFO` (optional; set to `DEBUG` for verbose line-by-line tracing).
+  - `GITLAB_DISCOVERY_DOTENV=.env` (optional; override to point at a different env file to auto-load).
+  - `GITLAB_DISCOVERY_LFS_THRESHOLD_MB=100` (optional; raise/lower the Git LFS candidate threshold for repo audits).
 - Create env and install deps:
 ```bash
 uv venv
@@ -18,16 +21,28 @@ uv sync
 ```
 
 ## Run
-- Using env vars from `.env` (loads via Typer env support):
+- Environment variables from `.env` are loaded automatically (override path with `GITLAB_DISCOVERY_DOTENV` if needed).
+- Group/member discovery (default):
 ```bash
-export $(cat .env | xargs)
 uv run gitlab-discovery audit
 ```
-- Reports land in `OUTPUT_DIR`: `groups.csv`, `users.csv`, `memberships.csv`, `summary.json`.
+  - If you omit `--root-group`, every top-level group you can access will be audited automatically. Reports are written beneath `OUTPUT_DIR/<timestamp>/<group_name>`.
+  - Each run writes artifacts into `OUTPUT_DIR/<YYYYMMDD-HHMMSS>/<group_name>/` (default base is `output/`), keeping a full history of `groups.csv`, `users.csv`, `memberships.csv`, and `summary.json` (which now mirrors every CSV record plus per-user group/email insight). A merged `client_report.csv` lives at `OUTPUT_DIR/<timestamp>/` with one row per membership including group + user metadata for easy sharing.
+- Repository-level audits (with Git LFS candidates):
+```bash
+# Scan every repository you can access
+uv run gitlab-discovery audit repo all
+
+# Focus on a single repository
+uv run gitlab-discovery audit group/subgroup/project
+```
+  - Outputs live under `OUTPUT_DIR/<timestamp>/repos/` and include comprehensive CSVs: repositories, large_files, project_members, project_hooks, project_integrations, pipelines, pipeline_jobs, pipeline_schedules, protected_branches, protected_tags, environments, deployments, packages, registry_repositories, registry_tags, releases, tags, ci_variables, plus `repo_summary.json` (mirrors every record) and `repo_client_report.csv`. Large files ≥ `GITLAB_DISCOVERY_LFS_THRESHOLD_MB` are flagged for Git LFS migration.
 
 ## Supported parameters
 - `--token`: GitLab PAT with `read_api` (required).
-- `--root-group`: Group ID or full path to start discovery; if omitted, uses your only top-level group (membership).
+- `--root-group`: Group ID or full path to start discovery; if omitted, every accessible top-level group is audited.
 - `--base-url`: GitLab instance URL (supports SaaS and self-managed, e.g., `https://gitlab.ustpace.com/`).
 - `--output`: Directory to write reports.
 - `--include-emails`: Attempt to fetch user emails and bot flag (needs admin; best effort).
+- `audit repo all`: Repository mode covering every accessible project (finds >100 MB files for Git LFS).
+- `audit <group/project>`: Repository mode scoped to one project path or ID.

@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import csv
 import json
-from collections import Counter
+import logging
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from .gitlab_client import GitLabAPIError, GitLabClient
+
+log = logging.getLogger(__name__)
 
 ACCESS_LEVELS = {
     0: "no_access",
@@ -79,19 +82,26 @@ def audit_gitlab(
     client: GitLabClient,
     root_group_ref: str,
     include_emails: bool = False,
-    output_dir: Path | str = "reports",
+    output_dir: Path | str = "output",
     console: Console | None = None,
 ) -> AuditResult:
     console = console or Console(stderr=True)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    log.info("Output directory prepared at %s", output_path.resolve())
 
     groups: list[GroupInfo] = []
     users: dict[int, UserInfo] = {}
     memberships: list[MembershipInfo] = []
+    user_groups: defaultdict[int, set[str]] = defaultdict(set)
 
     root_group = client.get_group(root_group_ref)
     console.print(f"Discovered root group: [bold]{root_group.get('full_path')}[/] (id={root_group.get('id')})")
+    log.info(
+        "Fetched root group %s (id=%s)",
+        root_group.get("full_path") or root_group.get("path"),
+        root_group.get("id"),
+    )
 
     def upsert_user(member_obj: dict) -> UserInfo:
         user_id = int(member_obj["id"])
@@ -132,6 +142,7 @@ def audit_gitlab(
             web_url=group_obj.get("web_url"),
         )
         groups.append(group_info)
+        log.debug("Processing group %s (id=%s)", group_info.full_path, group_info.id)
 
         for member in client.iter_group_members(group_info.id, include_inherited=True):
             user = upsert_user(member)
@@ -146,6 +157,7 @@ def audit_gitlab(
                 expires_at=member.get("expires_at"),
             )
             memberships.append(membership)
+            user_groups[user.id].add(group_info.full_path)
 
         for subgroup in client.iter_subgroups(group_info.id):
             walk_group(subgroup, parent_id=group_info.id)
@@ -167,6 +179,7 @@ def audit_gitlab(
                 detail = client.get_user(user.id)
             except GitLabAPIError as exc:  # skip users we cannot read
                 console.print(f"[yellow]Warning:[/] could not fetch user {user.username} ({user.id}): {exc}")
+                log.warning("Could not fetch user %s (%s): %s", user.username, user.id, exc)
                 continue
             if detail.get("email"):
                 user.email = detail["email"]
@@ -181,6 +194,7 @@ def audit_gitlab(
         ["id", "name", "full_path", "parent_id", "web_url"],
         (asdict(g) for g in groups),
     )
+    log.info("groups.csv written with %s rows", len(groups))
     _write_csv(
         output_path / "users.csv",
         ["id", "username", "name", "state", "is_bot", "web_url", "email"],
@@ -192,11 +206,24 @@ def audit_gitlab(
             for u in users.values()
         ),
     )
+    log.info("users.csv written with %s rows", len(users))
     _write_csv(
         output_path / "memberships.csv",
         ["group_id", "group_full_path", "user_id", "username", "access_level", "access_label", "expires_at"],
         (asdict(m) for m in memberships),
     )
+    log.info("memberships.csv written with %s rows", len(memberships))
+
+    user_group_details = [
+        {
+            "id": user.id,
+            "username": user.username,
+            "name": user.name,
+            "email": user.email,
+            "groups": sorted(user_groups.get(user.id, [])),
+        }
+        for user in users.values()
+    ]
 
     summary = {
         "groups": len(groups),
@@ -204,9 +231,73 @@ def audit_gitlab(
         "bots": sum(1 for u in users.values() if u.is_bot),
         "memberships": len(memberships),
         "states": Counter(u.state for u in users.values()),
+        "user_group_details": user_group_details,
+        "groups_data": [asdict(g) for g in groups],
+        "users_data": [
+            {
+                **asdict(u),
+                "is_bot": None if u.is_bot is None else bool(u.is_bot),
+            }
+            for u in users.values()
+        ],
+        "memberships_data": [asdict(m) for m in memberships],
     }
     with (output_path / "summary.json").open("w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, sort_keys=True, default=str)
+    log.info("summary.json written (groups=%s users=%s memberships=%s)", summary["groups"], summary["users"], summary["memberships"])
 
     console.print(f"Wrote reports to {output_path.resolve()}")
     return AuditResult(groups=groups, users=users, memberships=memberships, summary=summary, output_dir=output_path)
+
+
+def write_combined_membership_report(results: Sequence[AuditResult], destination: Path | str) -> Path:
+    dest_path = Path(destination)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "root_group",
+        "group_id",
+        "group_full_path",
+        "group_parent_id",
+        "group_web_url",
+        "user_id",
+        "username",
+        "name",
+        "email",
+        "state",
+        "is_bot",
+        "user_web_url",
+        "access_level",
+        "access_label",
+        "expires_at",
+    ]
+    with dest_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for result in results:
+            root_group = result.groups[0].full_path if result.groups else "unknown"
+            group_lookup = {g.id: g for g in result.groups}
+            for membership in result.memberships:
+                group_info = group_lookup.get(membership.group_id)
+                user = result.users.get(membership.user_id)
+                writer.writerow(
+                    {
+                        "root_group": root_group,
+                        "group_id": membership.group_id,
+                        "group_full_path": membership.group_full_path,
+                        "group_parent_id": group_info.parent_id if group_info else None,
+                        "group_web_url": group_info.web_url if group_info else None,
+                        "user_id": membership.user_id,
+                        "username": membership.username,
+                        "name": user.name if user else "",
+                        "email": user.email if user else "",
+                        "state": user.state if user else "",
+                        "is_bot": "" if user is None or user.is_bot is None else str(user.is_bot).lower(),
+                        "user_web_url": user.web_url if user else "",
+                        "access_level": membership.access_level,
+                        "access_label": membership.access_label,
+                        "expires_at": membership.expires_at,
+                    }
+                )
+
+    log.info("Combined client report written to %s", dest_path)
+    return dest_path

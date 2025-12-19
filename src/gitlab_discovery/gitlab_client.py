@@ -30,6 +30,13 @@ def _encode_group_ref(ref: str | int) -> str:
     return quote(str(ref), safe="/")
 
 
+def _encode_project_ref(ref: str | int) -> str:
+    if isinstance(ref, int) or str(ref).isdigit():
+        return str(ref)
+    # Encode slashes for project refs
+    return quote(str(ref), safe="")
+
+
 class GitLabClient:
     """
     Thin wrapper around GitLab REST API (v4) with pagination and retry handling.
@@ -149,3 +156,112 @@ class GitLabClient:
     def get_user(self, user_id: int) -> dict[str, t.Any]:
         response = self._request("GET", f"/users/{user_id}")
         return response.json()
+
+    def iter_projects(
+        self,
+        membership_only: bool = True,
+        include_statistics: bool = True,
+        simple: bool = False,
+    ) -> t.Iterator[dict[str, t.Any]]:
+        params: dict[str, t.Any] = {
+            "order_by": "path",
+            "sort": "asc",
+        }
+        if membership_only:
+            params["membership"] = True
+        if include_statistics:
+            params["statistics"] = True
+        if simple:
+            params["simple"] = True
+        return self._paginate("/projects", params=params)
+
+    def get_project(self, ref: str | int, include_statistics: bool = True) -> dict[str, t.Any]:
+        ref_enc = _encode_project_ref(ref)
+        params = {"statistics": True} if include_statistics else None
+        response = self._request("GET", f"/projects/{ref_enc}", params=params)
+        return response.json()
+
+    def iter_project_tree(
+        self,
+        project_id: int,
+        ref: str,
+        recursive: bool = True,
+    ) -> t.Iterator[dict[str, t.Any]]:
+        params = {
+            "ref": ref,
+            "recursive": recursive,
+        }
+        return self._paginate(f"/projects/{project_id}/repository/tree", params=params)
+
+    def get_blob(self, project_id: int, blob_sha: str) -> dict[str, t.Any]:
+        response = self._request("GET", f"/projects/{project_id}/repository/blobs/{blob_sha}")
+        return response.json()
+
+    def iter_project_members(
+        self,
+        project_id: int,
+        include_inherited: bool = True,
+    ) -> t.Iterator[dict[str, t.Any]]:
+        suffix = "/all" if include_inherited else ""
+        return self._paginate(f"/projects/{project_id}/members{suffix}")
+
+    def list_project_hooks(self, project_id: int) -> list[dict[str, t.Any]]:
+        response = self._request("GET", f"/projects/{project_id}/hooks")
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise GitLabAPIError("Expected hooks list response")
+        return payload
+
+    def list_project_integrations(self, project_id: int) -> list[dict[str, t.Any]]:
+        response = self._request("GET", f"/projects/{project_id}/integrations")
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise GitLabAPIError("Expected integrations list response")
+        return payload
+
+    def iter_project_pipelines(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
+        return self._paginate(f"/projects/{project_id}/pipelines")
+
+    def iter_pipeline_jobs(self, project_id: int, pipeline_id: int) -> t.Iterator[dict[str, t.Any]]:
+        return self._paginate(f"/projects/{project_id}/pipelines/{pipeline_id}/jobs")
+
+    def iter_project_releases(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
+        return self._paginate(f"/projects/{project_id}/releases")
+
+    def iter_project_tags(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
+        return self._paginate(f"/projects/{project_id}/repository/tags")
+
+    def iter_project_protected_branches(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
+        return self._paginate(f"/projects/{project_id}/protected_branches")
+
+    def iter_project_protected_tags(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
+        return self._paginate(f"/projects/{project_id}/protected_tags")
+
+    def iter_project_environments(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
+        return self._paginate(f"/projects/{project_id}/environments")
+
+    def iter_project_deployments(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
+        return self._paginate(f"/projects/{project_id}/deployments")
+
+    def iter_project_packages(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
+        return self._paginate(f"/projects/{project_id}/packages")
+
+    def list_registry_repositories(self, project_id: int) -> list[dict[str, t.Any]]:
+        response = self._request("GET", f"/projects/{project_id}/registry/repositories")
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise GitLabAPIError("Expected registry repositories list response")
+        return payload
+
+    def list_registry_repository_tags(self, project_id: int, registry_id: int) -> list[dict[str, t.Any]]:
+        response = self._request("GET", f"/projects/{project_id}/registry/repositories/{registry_id}/tags")
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise GitLabAPIError("Expected registry tags list response")
+        return payload
+
+    def iter_project_variables(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
+        return self._paginate(f"/projects/{project_id}/variables")
+
+    def iter_project_pipeline_schedules(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
+        return self._paginate(f"/projects/{project_id}/pipeline_schedules")
