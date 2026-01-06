@@ -139,6 +139,28 @@ class GitLabClient:
             params={"with_projects": False},
         )
 
+    def iter_group_projects(
+        self,
+        group_id: int,
+        include_subgroups: bool = False,
+    ) -> t.Iterator[dict[str, t.Any]]:
+        params: dict[str, t.Any] = {
+            "include_subgroups": include_subgroups,
+            "with_shared": False,
+        }
+        return self._paginate(f"/groups/{group_id}/projects", params=params)
+
+    def iter_group_projects(
+        self,
+        group_id: int,
+        include_subgroups: bool = False,
+    ) -> t.Iterator[dict[str, t.Any]]:
+        params: dict[str, t.Any] = {
+            "include_subgroups": include_subgroups,
+            "with_shared": False,
+        }
+        return self._paginate(f"/groups/{group_id}/projects", params=params)
+
     def iter_top_level_groups(self, membership_only: bool = True) -> t.Iterator[dict[str, t.Any]]:
         params: dict[str, t.Any] = {"top_level_only": True}
         if membership_only:

@@ -37,6 +37,27 @@ uv run gitlab-discovery audit repo all
 uv run gitlab-discovery audit group/subgroup/project
 ```
   - Outputs live under `OUTPUT_DIR/<timestamp>/repos/` and include comprehensive CSVs: repositories, large_files, project_members, project_hooks, project_integrations, pipelines, pipeline_jobs, pipeline_schedules, protected_branches, protected_tags, environments, deployments, packages, registry_repositories, registry_tags, releases, tags, ci_variables, plus `repo_summary.json` (mirrors every record) and `repo_client_report.csv`. Large files ≥ `GITLAB_DISCOVERY_LFS_THRESHOLD_MB` are flagged for Git LFS migration.
+- Find large files (Git LFS prep) for a single repository:
+```bash
+uv run gitlab-discovery find-large-files group/subgroup/project --threshold-mb 50
+```
+  - Walks the default branch and writes `large_files.csv` + `large_files.json` under `OUTPUT_DIR/<timestamp>/large-files/<project>/`.
+- You can also pass the repository via `--repo-name` (instead of positional):
+```bash
+uv run gitlab-discovery find-large-files --repo-name group/subgroup/project --threshold-mb 50
+```
+- Find large files across every repo in a group (with subgroups):
+```bash
+uv run gitlab-discovery find-large-files portal-services --group --threshold-mb 50
+```
+  - Scans each project’s default branch under the group, writes one CSV/JSON, and lists any projects skipped for missing default branches.
+- Quick repository count/listing (lightweight, read-only):
+```bash
+uv run gitlab-discovery list-repos --root-group my-group
+# or list everything you can access
+uv run gitlab-discovery list-repos
+```
+  - Writes a `repositories.csv` and `repositories.json` under `OUTPUT_DIR/<timestamp>/repo-list-*/` with id, path, visibility, and other metadata, and prints a count to the console.
 
 ## Supported parameters
 - `--token`: GitLab PAT with `read_api` (required).
