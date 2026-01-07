@@ -58,6 +58,16 @@ uv run gitlab-discovery list-repos --root-group my-group
 uv run gitlab-discovery list-repos
 ```
   - Writes a `repositories.csv` and `repositories.json` under `OUTPUT_DIR/<timestamp>/repo-list-*/` with id, path, visibility, and other metadata, and prints a count to the console.
+- Just names and URLs for all accessible repos:
+```bash
+uv run gitlab-discovery list-repo-urls
+```
+  - Saves `repository_urls.csv` and `repository_urls.json` under `OUTPUT_DIR/<timestamp>/repo-urls/`.
+- All users (active by default; best-effort email + bots included):
+```bash
+uv run gitlab-discovery list-users --include-email
+```
+  - Saves `users.csv` and `users.json` under `OUTPUT_DIR/<timestamp>/users/`. Email visibility on GitLab SaaS generally requires an admin token; otherwise emails may be blank and warnings are recorded.
 
 ## Supported parameters
 - `--token`: GitLab PAT with `read_api` (required).

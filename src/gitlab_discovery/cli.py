@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import csv
 import json
 from dataclasses import asdict
+from urllib.parse import urlparse
 
 import typer
 from rich.console import Console
@@ -197,6 +198,249 @@ def list_repositories(
     console.print(f"[blue]Reports written to {run_root}[/]")
 
 
+@app.command("list-repo-urls")
+def list_repo_urls(
+    token: str = typer.Option(
+        None,
+        "--token",
+        envvar="GITLAB_TOKEN",
+        help="GitLab personal access token with read_api scope.",
+    ),
+    base_url: str = typer.Option(
+        "https://gitlab.com",
+        "--base-url",
+        envvar="GITLAB_BASE_URL",
+        help="GitLab base URL (defaults to gitlab.com). Can be set via GITLAB_BASE_URL.",
+    ),
+    output: Path = typer.Option(
+        Path("output"),
+        "--output",
+        "-o",
+        file_okay=False,
+        dir_okay=True,
+        envvar="OUTPUT_DIR",
+        help="Directory to write repository URL listing. Can be set via OUTPUT_DIR.",
+    ),
+    membership_only: bool = typer.Option(
+        True,
+        "--membership-only/--all-accessible",
+        help="Limit to projects you are a member of (default). Disable to list all accessible projects.",
+    ),
+) -> None:
+    """List all accessible repositories (name + URLs only)."""
+    if not token:
+        raise typer.BadParameter("GitLab token is required via --token or env GITLAB_TOKEN")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    run_root = output / timestamp / "repo-urls"
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "name",
+        "path_with_namespace",
+        "web_url",
+        "ssh_url_to_repo",
+        "http_url_to_repo",
+    ]
+
+    try:
+        with GitLabClient(base_url=base_url, token=token) as client:
+            console.print(
+                f"[cyan]Listing repository names and URLs (membership_only={membership_only}).[/]"
+            )
+            projects = list(
+                client.iter_projects(
+                    membership_only=membership_only,
+                    include_statistics=False,
+                    simple=True,
+                )
+            )
+    except GitLabAPIError as exc:
+        console.print(f"[red]GitLab API error while listing repository URLs:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:  # pragma: no cover - safety net
+        console.print(f"[red]Unexpected error while listing repository URLs:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    csv_path = run_root / "repository_urls.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for repo in projects:
+            writer.writerow(
+                {
+                    "name": repo.get("name"),
+                    "path_with_namespace": repo.get("path_with_namespace") or repo.get("path"),
+                    "web_url": repo.get("web_url"),
+                    "ssh_url_to_repo": repo.get("ssh_url_to_repo"),
+                    "http_url_to_repo": repo.get("http_url_to_repo"),
+                }
+            )
+
+    summary_path = run_root / "repository_urls.json"
+    with summary_path.open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "count": len(projects),
+                "membership_only": membership_only,
+                "repositories": [
+                    {
+                        "name": repo.get("name"),
+                        "path_with_namespace": repo.get("path_with_namespace") or repo.get("path"),
+                        "web_url": repo.get("web_url"),
+                        "ssh_url_to_repo": repo.get("ssh_url_to_repo"),
+                        "http_url_to_repo": repo.get("http_url_to_repo"),
+                    }
+                    for repo in projects
+                ],
+            },
+            fh,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+
+    console.print("\n[bold green]Repository URL listing complete.[/]")
+    console.print(f"Repositories found: {len(projects)}")
+    for repo in projects:
+        console.print(f"- {repo.get('path_with_namespace') or repo.get('path')}: {repo.get('web_url')}")
+    console.print(f"[blue]Reports written to {run_root}[/]")
+
+
+@app.command("list-users")
+def list_users(
+    token: str = typer.Option(
+        None,
+        "--token",
+        envvar="GITLAB_TOKEN",
+        help="GitLab personal access token with read_api scope.",
+    ),
+    base_url: str = typer.Option(
+        "https://gitlab.com",
+        "--base-url",
+        envvar="GITLAB_BASE_URL",
+        help="GitLab base URL (defaults to gitlab.com). Can be set via GITLAB_BASE_URL.",
+    ),
+    output: Path = typer.Option(
+        Path("output"),
+        "--output",
+        "-o",
+        file_okay=False,
+        dir_okay=True,
+        envvar="OUTPUT_DIR",
+        help="Directory to write user listing. Can be set via OUTPUT_DIR.",
+    ),
+    include_inactive: bool = typer.Option(
+        False,
+        "--include-inactive",
+        help="Include inactive users (default lists active only).",
+    ),
+    include_email: bool = typer.Option(
+        True,
+        "--include-email/--no-include-email",
+        help="Best-effort to fetch email for each user (requires admin on GitLab SaaS).",
+    ),
+) -> None:
+    """
+    List users (active by default) including bots, with username, email (best-effort), and profile URL.
+    Email visibility on GitLab SaaS generally requires an admin token.
+    """
+    if not token:
+        raise typer.BadParameter("GitLab token is required via --token or env GITLAB_TOKEN")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    run_root = output / timestamp / "users"
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = ["id", "username", "name", "state", "is_bot", "web_url", "email"]
+
+    users: list[dict[str, object]] = []
+    email_errors: list[dict[str, str]] = []
+    active_param: bool | None = None if include_inactive else True
+    warned_email_permission = False
+
+    try:
+        with GitLabClient(base_url=base_url, token=token) as client:
+            console.print(
+                f"[cyan]Listing users (active_only={active_param is True}, include_email={include_email}).[/]"
+            )
+            raw_users = list(client.iter_users(active=active_param))
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                transient=False,
+                console=console,
+            ) as progress:
+                task = progress.add_task("Fetching user details...", total=len(raw_users))
+                for user in raw_users:
+                    detail = user
+                    if include_email:
+                        try:
+                            detail = client.get_user(int(user["id"]))
+                        except GitLabAPIError as exc:
+                            email_errors.append({"user": user.get("username", ""), "error": str(exc)})
+                            if not warned_email_permission and exc.status_code in (401, 403):
+                                console.print(
+                                    "[yellow]Warning:[/] Email visibility is restricted on GitLab SaaS; admin token required."
+                                )
+                                warned_email_permission = True
+                    is_bot = detail.get("is_bot")
+                    if is_bot is None and "bot" in detail:
+                        is_bot = detail.get("bot")
+                    users.append(
+                        {
+                            "id": detail.get("id"),
+                            "username": detail.get("username"),
+                            "name": detail.get("name"),
+                            "state": detail.get("state"),
+                            "is_bot": is_bot,
+                            "web_url": detail.get("web_url"),
+                            "email": detail.get("email"),
+                        }
+                    )
+                    progress.advance(task)
+    except GitLabAPIError as exc:
+        console.print(f"[red]GitLab API error while listing users:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:  # pragma: no cover - safety net
+        console.print(f"[red]Unexpected error while listing users:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    csv_path = run_root / "users.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for user in users:
+            writer.writerow(
+                {
+                    **user,
+                    "is_bot": "" if user.get("is_bot") is None else str(user.get("is_bot")).lower(),
+                }
+            )
+
+    summary_path = run_root / "users.json"
+    with summary_path.open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "count": len(users),
+                "active_only": active_param is True,
+                "include_email": include_email,
+                "email_errors": email_errors,
+                "users": users,
+            },
+            fh,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+
+    console.print("\n[bold green]User listing complete.[/]")
+    console.print(f"Users found: {len(users)} (active_only={active_param is True})")
+    if email_errors:
+        console.print(f"[yellow]Email fetch warnings for {len(email_errors)} user(s); see users.json for details.[/]")
+    console.print(f"[blue]Reports written to {run_root}[/]")
+
+
 @app.command("find-large-files")
 def find_large_files(
     target: str | None = typer.Argument(
@@ -268,6 +512,38 @@ def find_large_files(
     skipped_projects_errors: list[dict[str, str]] = []
     repo_filter = repo_name
 
+    def _normalize_ref(ref: str | None) -> str | None:
+        if not ref:
+            return None
+        if ref.startswith("http"):
+            parsed = urlparse(ref)
+            path = parsed.path.lstrip("/")
+            if path.endswith(".git"):
+                path = path[:-4]
+            return path
+        return ref
+
+    target = _normalize_ref(target)
+    repo_name = _normalize_ref(repo_name)
+    def _resolve_project_by_name(client: GitLabClient, name: str) -> dict[str, object]:
+        candidates = [
+            p
+            for p in client.iter_projects(
+                membership_only=True,
+                include_statistics=False,
+                simple=True,
+                search=name,
+            )
+            if p.get("path") == name or p.get("name") == name
+        ]
+        if not candidates:
+            raise GitLabAPIError(f"Repository named '{name}' not found or not accessible")
+        if len(candidates) > 1:
+            raise GitLabAPIError(
+                f"Multiple repositories named '{name}' found; please pass the full path_with_namespace"
+            )
+        return candidates[0]
+
     try:
         with GitLabClient(base_url=base_url, token=token) as client:
             if group:
@@ -284,11 +560,19 @@ def find_large_files(
                         p
                         for p in projects
                         if (p.get("path_with_namespace") or p.get("path")) == repo_filter
-                    or str(p.get("id")) == repo_filter
-                ]
+                        or ("/" not in repo_filter and (p.get("path") == repo_filter or p.get("name") == repo_filter))
+                        or str(p.get("id")) == repo_filter
+                    ]
+                    if not projects:
+                        raise GitLabAPIError(
+                            f"Repository '{repo_filter}' not found in group {group_label} (or not accessible)"
+                        )
             else:
                 project_ref = repo_name or target
-                project = client.get_project(project_ref, include_statistics=False)
+                if project_ref and "/" not in project_ref and not str(project_ref).isdigit():
+                    project = _resolve_project_by_name(client, project_ref)
+                else:
+                    project = client.get_project(project_ref, include_statistics=False)
                 projects = [project]
 
             if not projects:

@@ -167,6 +167,21 @@ class GitLabClient:
             params["membership"] = True
         return self._paginate("/groups", params=params)
 
+    def iter_users(
+        self,
+        active: bool | None = None,
+        blocked: bool | None = None,
+    ) -> t.Iterator[dict[str, t.Any]]:
+        params: dict[str, t.Any] = {
+            "order_by": "id",
+            "sort": "asc",
+        }
+        if active is not None:
+            params["active"] = active
+        if blocked is not None:
+            params["blocked"] = blocked
+        return self._paginate("/users", params=params)
+
     def iter_group_members(
         self,
         group_id: int,
@@ -184,6 +199,7 @@ class GitLabClient:
         membership_only: bool = True,
         include_statistics: bool = True,
         simple: bool = False,
+        search: str | None = None,
     ) -> t.Iterator[dict[str, t.Any]]:
         params: dict[str, t.Any] = {
             "order_by": "path",
@@ -195,6 +211,8 @@ class GitLabClient:
             params["statistics"] = True
         if simple:
             params["simple"] = True
+        if search:
+            params["search"] = search
         return self._paginate("/projects", params=params)
 
     def get_project(self, ref: str | int, include_statistics: bool = True) -> dict[str, t.Any]:
