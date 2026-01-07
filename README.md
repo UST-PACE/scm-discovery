@@ -56,6 +56,11 @@ uv run gitlab-discovery find-large-files portal-services --group --threshold-mb 
 uv run gitlab-discovery check-lfs https://gitlab.ustpace.com/group/subgroup/repo
 ```
   - Writes `lfs_check.json` under `OUTPUT_DIR/<timestamp>/lfs-check/<repo>/` with flags and sample pointer files if found.
+- Check PAT rate-limit headers and current user:
+```bash
+uv run gitlab-discovery check-rate-limit
+```
+  - Saves `rate_limit.json` under `OUTPUT_DIR/<timestamp>/rate-limit/` showing current user info and rate-limit headers (Remaining/Limit/Reset).
 - Quick repository count/listing (lightweight, read-only):
 ```bash
 uv run gitlab-discovery list-repos --root-group my-group

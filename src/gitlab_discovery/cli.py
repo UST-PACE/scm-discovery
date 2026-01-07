@@ -4,7 +4,7 @@ import sys
 import logging
 import os
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import csv
 import json
 from dataclasses import asdict
@@ -583,6 +583,106 @@ def check_lfs_usage(
     if lfs_pointer_files:
         for lf in lfs_pointer_files:
             console.print(f"- {lf['path']} ({lf['size_bytes']} bytes)")
+    console.print(f"[blue]Report written to {summary_path}[/]")
+
+
+@app.command("check-rate-limit")
+def check_rate_limit(
+    token: str = typer.Option(
+        None,
+        "--token",
+        envvar="GITLAB_TOKEN",
+        help="GitLab personal access token with read_api scope.",
+    ),
+    base_url: str = typer.Option(
+        "https://gitlab.com",
+        "--base-url",
+        envvar="GITLAB_BASE_URL",
+        help="GitLab base URL (defaults to gitlab.com). Can be set via GITLAB_BASE_URL.",
+    ),
+    output: Path = typer.Option(
+        Path("output"),
+        "--output",
+        "-o",
+        file_okay=False,
+        dir_okay=True,
+        envvar="OUTPUT_DIR",
+        help="Directory to write the rate limit report. Can be set via OUTPUT_DIR.",
+    ),
+) -> None:
+    """Check current PAT user and rate-limit headers returned by the GitLab API."""
+    if not token:
+        raise typer.BadParameter("GitLab token is required via --token or env GITLAB_TOKEN")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    run_root = output / timestamp / "rate-limit"
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    def _parse_reset_headers(headers: dict[str, str]) -> tuple[str | None, str | None, float | None]:
+        reset_at_utc = headers.get("RateLimit-ResetTime") or None
+        reset_epoch = headers.get("RateLimit-Reset")
+        seconds_until_reset: float | None = None
+        reset_at_ist: str | None = None
+        if reset_epoch and str(reset_epoch).isdigit():
+            try:
+                reset_ts = int(reset_epoch)
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                seconds_until_reset = max(reset_ts - now_ts, 0)
+                reset_dt_utc = datetime.fromtimestamp(reset_ts, tz=timezone.utc)
+                if not reset_at_utc:
+                    reset_at_utc = reset_dt_utc.isoformat()
+                reset_dt_ist = reset_dt_utc.astimezone(timezone(timedelta(hours=5, minutes=30)))
+                reset_at_ist = reset_dt_ist.isoformat()
+            except Exception:
+                seconds_until_reset = None
+        return reset_at_utc, reset_at_ist, seconds_until_reset
+
+    try:
+        with GitLabClient(base_url=base_url, token=token) as client:
+            user_payload, headers = client.get_current_user()
+    except GitLabAPIError as exc:
+        console.print(f"[red]GitLab API error while checking rate limit:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:  # pragma: no cover - safety net
+        console.print(f"[red]Unexpected error while checking rate limit:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    reset_time_utc, reset_time_ist, seconds_until_reset = _parse_reset_headers(headers)
+
+    limit_info = {
+        "limit": headers.get("RateLimit-Limit"),
+        "observed": headers.get("RateLimit-Observed"),
+        "remaining": headers.get("RateLimit-Remaining"),
+        "reset": headers.get("RateLimit-Reset"),
+        "reset_time": reset_time_utc,
+        "reset_time_ist": reset_time_ist,
+        "seconds_until_reset": seconds_until_reset,
+        "window": headers.get("RateLimit-Window"),
+    }
+
+    summary = {
+        "user": {
+            "id": user_payload.get("id"),
+            "username": user_payload.get("username"),
+            "name": user_payload.get("name"),
+            "state": user_payload.get("state"),
+        },
+        "rate_limit_headers": limit_info,
+    }
+
+    summary_path = run_root / "rate_limit.json"
+    with summary_path.open("w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2, sort_keys=True, default=str)
+
+    console.print("\n[bold green]Rate limit check complete.[/]")
+    console.print(
+        f"User: {user_payload.get('username')} (id={user_payload.get('id')}) | Remaining: {limit_info.get('remaining')} / {limit_info.get('limit')}"
+    )
+    if reset_time_utc or reset_time_ist or seconds_until_reset is not None:
+        console.print(
+            f"Resets at UTC: {reset_time_utc or 'unknown'}; IST: {reset_time_ist or 'unknown'}"
+            + (f" (in ~{int(seconds_until_reset)}s)" if seconds_until_reset is not None else "")
+        )
     console.print(f"[blue]Report written to {summary_path}[/]")
 
 

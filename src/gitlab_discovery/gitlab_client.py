@@ -194,6 +194,10 @@ class GitLabClient:
         response = self._request("GET", f"/users/{user_id}")
         return response.json()
 
+    def get_current_user(self) -> dict[str, t.Any]:
+        response = self._request("GET", "/user")
+        return response.json(), response.headers
+
     def iter_projects(
         self,
         membership_only: bool = True,
