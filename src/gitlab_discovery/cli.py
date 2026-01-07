@@ -9,6 +9,8 @@ import csv
 import json
 from dataclasses import asdict
 from urllib.parse import urlparse
+from collections import defaultdict
+from base64 import b64decode
 
 import typer
 from rich.console import Console
@@ -42,6 +44,18 @@ def _safe_group_dir_name(ref: str) -> str:
     clean = ref.strip().strip("/")
     clean = clean.replace("/", "__")
     return clean or "group"
+
+
+def _normalize_ref(ref: str | None) -> str | None:
+    if not ref:
+        return None
+    if ref.startswith("http"):
+        parsed = urlparse(ref)
+        path = parsed.path.lstrip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        return path
+    return ref.strip()
 
 
 @app.command("features")
@@ -307,6 +321,271 @@ def list_repo_urls(
     console.print(f"[blue]Reports written to {run_root}[/]")
 
 
+@app.command("find-duplicate-repos")
+def find_duplicate_repos(
+    token: str = typer.Option(
+        None,
+        "--token",
+        envvar="GITLAB_TOKEN",
+        help="GitLab personal access token with read_api scope.",
+    ),
+    base_url: str = typer.Option(
+        "https://gitlab.com",
+        "--base-url",
+        envvar="GITLAB_BASE_URL",
+        help="GitLab base URL (defaults to gitlab.com). Can be set via GITLAB_BASE_URL.",
+    ),
+    output: Path = typer.Option(
+        Path("output"),
+        "--output",
+        "-o",
+        file_okay=False,
+        dir_okay=True,
+        envvar="OUTPUT_DIR",
+        help="Directory to write duplicate repository report. Can be set via OUTPUT_DIR.",
+    ),
+    membership_only: bool = typer.Option(
+        True,
+        "--membership-only/--all-accessible",
+        help="Limit to repositories you are a member of (default). Disable to list all accessible repositories.",
+    ),
+) -> None:
+    """Find duplicate repository names across accessible projects."""
+    if not token:
+        raise typer.BadParameter("GitLab token is required via --token or env GITLAB_TOKEN")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    run_root = output / timestamp / "duplicate-repos"
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with GitLabClient(base_url=base_url, token=token) as client:
+            console.print(
+                f"[cyan]Scanning repositories for duplicate names (membership_only={membership_only}).[/]"
+            )
+            projects = list(
+                client.iter_projects(
+                    membership_only=membership_only,
+                    include_statistics=False,
+                    simple=True,
+                )
+            )
+    except GitLabAPIError as exc:
+        console.print(f"[red]GitLab API error while listing repositories:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:  # pragma: no cover - safety net
+        console.print(f"[red]Unexpected error while listing repositories:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    groups: defaultdict[str, list[dict[str, object]]] = defaultdict(list)
+    for repo in projects:
+        name = repo.get("name") or repo.get("path") or ""
+        groups[name].append(repo)
+
+    duplicates = {name: repos for name, repos in groups.items() if len(repos) > 1}
+
+    csv_path = run_root / "duplicate_repositories.csv"
+    fieldnames = ["name", "path_with_namespace", "id", "visibility", "web_url"]
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for name, repos in sorted(duplicates.items()):
+            for repo in repos:
+                writer.writerow(
+                    {
+                        "name": name,
+                        "path_with_namespace": repo.get("path_with_namespace") or repo.get("path"),
+                        "id": repo.get("id"),
+                        "visibility": repo.get("visibility"),
+                        "web_url": repo.get("web_url"),
+                    }
+                )
+
+    summary_path = run_root / "duplicate_repositories.json"
+    with summary_path.open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "membership_only": membership_only,
+                "total_repositories": len(projects),
+                "duplicate_names": len(duplicates),
+                "duplicates": [
+                    {
+                        "name": name,
+                        "count": len(repos),
+                        "repositories": [
+                            {
+                                "path_with_namespace": repo.get("path_with_namespace") or repo.get("path"),
+                                "id": repo.get("id"),
+                                "visibility": repo.get("visibility"),
+                                "web_url": repo.get("web_url"),
+                            }
+                            for repo in repos
+                        ],
+                    }
+                    for name, repos in sorted(duplicates.items())
+                ],
+            },
+            fh,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+
+    console.print("\n[bold green]Duplicate repository scan complete.[/]")
+    if duplicates:
+        console.print(f"Duplicate names found: {len(duplicates)} (see {csv_path})")
+    else:
+        console.print("No duplicate repository names found.")
+    console.print(f"[blue]Reports written to {run_root}[/]")
+
+
+@app.command("check-lfs")
+def check_lfs_usage(
+    repo: str = typer.Argument(
+        ...,
+        metavar="<repo-url|path|id>",
+        help="Repository URL, path_with_namespace, short path, or id to check for Git LFS usage.",
+    ),
+    token: str = typer.Option(
+        None,
+        "--token",
+        envvar="GITLAB_TOKEN",
+        help="GitLab personal access token with read_api scope.",
+    ),
+    base_url: str = typer.Option(
+        "https://gitlab.com",
+        "--base-url",
+        envvar="GITLAB_BASE_URL",
+        help="GitLab base URL (defaults to gitlab.com). Can be set via GITLAB_BASE_URL.",
+    ),
+    output: Path = typer.Option(
+        Path("output"),
+        "--output",
+        "-o",
+        file_okay=False,
+        dir_okay=True,
+        envvar="OUTPUT_DIR",
+        help="Directory to write the LFS check report. Can be set via OUTPUT_DIR.",
+    ),
+) -> None:
+    """
+    Check a repository for Git LFS usage:
+    - Reports project.lfs_enabled flag
+    - Looks for 'filter=lfs' rules in .gitattributes
+    - Detects LFS pointer files on the default branch
+    """
+    if not token:
+        raise typer.BadParameter("GitLab token is required via --token or env GITLAB_TOKEN")
+
+    repo_ref = _normalize_ref(repo)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    scope_dir = _safe_group_dir_name(repo_ref or "unknown")
+    run_root = output / timestamp / "lfs-check" / scope_dir
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with GitLabClient(base_url=base_url, token=token) as client:
+            project = client.get_project(repo_ref, include_statistics=True)
+            project_id = int(project["id"])
+            project_path = project.get("path_with_namespace") or project.get("path") or str(project_id)
+            default_branch = project.get("default_branch")
+            if not default_branch:
+                console.print(f"[red]Project {project_path} has no default branch; cannot inspect for LFS.[/]")
+                raise typer.Exit(code=1)
+
+            console.print(
+                f"[cyan]Checking Git LFS usage in[/] [bold]{project_path}[/] (branch {default_branch})."
+            )
+            lfs_enabled = bool(project.get("lfs_enabled"))
+
+            has_lfs_gitattributes = False
+            gitattributes_rules: list[dict[str, object]] = []
+            lfs_pointer_files: list[dict[str, object]] = []
+            pointer_limit = 20
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                transient=False,
+                console=console,
+            ) as progress:
+                task = progress.add_task("Scanning repository tree...", start=True)
+                for entry in client.iter_project_tree(
+                    project_id=project_id,
+                    ref=default_branch,
+                    recursive=True,
+                ):
+                    if entry.get("type") != "blob":
+                        continue
+                    path = entry.get("path", "")
+                    size = int(entry.get("size") or 0)
+                    blob_sha = entry.get("id")
+                    if not blob_sha:
+                        continue
+
+                    if path.endswith(".gitattributes") and size <= 128 * 1024:
+                        blob = client.get_blob(project_id=project_id, blob_sha=blob_sha)
+                        content = blob.get("content")
+                        if content and blob.get("encoding") == "base64":
+                            decoded = b64decode(content).decode("utf-8", errors="replace")
+                            gitattributes_rules.append({"path": path, "content": decoded})
+                            if "filter=lfs" in decoded:
+                                has_lfs_gitattributes = True
+
+                    if len(lfs_pointer_files) >= pointer_limit:
+                        continue
+                    if 80 <= size <= 2048:
+                        blob = client.get_blob(project_id=project_id, blob_sha=blob_sha)
+                        content = blob.get("content")
+                        if content and blob.get("encoding") == "base64":
+                            decoded = b64decode(content).decode("utf-8", errors="replace")
+                            if (
+                                "version https://git-lfs.github.com/spec/v1" in decoded
+                                and "oid sha256:" in decoded
+                            ):
+                                lfs_pointer_files.append(
+                                    {
+                                        "path": path,
+                                        "size_bytes": size,
+                                        "blob_sha": blob_sha,
+                                    }
+                                )
+                progress.update(task, advance=100)
+    except GitLabAPIError as exc:
+        console.print(f"[red]GitLab API error while checking LFS:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:  # pragma: no cover - safety net
+        console.print(f"[red]Unexpected error while checking LFS:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    lfs_detected = lfs_enabled or has_lfs_gitattributes or bool(lfs_pointer_files)
+
+    summary = {
+        "project_id": project_id,
+        "project_path": project_path,
+        "default_branch": default_branch,
+        "lfs_enabled": lfs_enabled,
+        "gitattributes_with_lfs": has_lfs_gitattributes,
+        "lfs_pointer_files_found": bool(lfs_pointer_files),
+        "lfs_pointer_samples": lfs_pointer_files,
+        "gitattributes_rules": gitattributes_rules,
+        "lfs_detected": lfs_detected,
+    }
+
+    summary_path = run_root / "lfs_check.json"
+    with summary_path.open("w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2, sort_keys=True, default=str)
+
+    console.print("\n[bold green]LFS check complete.[/]")
+    console.print(
+        f"LFS enabled flag: {lfs_enabled} | .gitattributes contains filter=lfs: {has_lfs_gitattributes} | LFS pointers: {len(lfs_pointer_files)}"
+    )
+    if lfs_pointer_files:
+        for lf in lfs_pointer_files:
+            console.print(f"- {lf['path']} ({lf['size_bytes']} bytes)")
+    console.print(f"[blue]Report written to {summary_path}[/]")
+
+
 @app.command("list-users")
 def list_users(
     token: str = typer.Option(
@@ -512,19 +791,9 @@ def find_large_files(
     skipped_projects_errors: list[dict[str, str]] = []
     repo_filter = repo_name
 
-    def _normalize_ref(ref: str | None) -> str | None:
-        if not ref:
-            return None
-        if ref.startswith("http"):
-            parsed = urlparse(ref)
-            path = parsed.path.lstrip("/")
-            if path.endswith(".git"):
-                path = path[:-4]
-            return path
-        return ref
-
     target = _normalize_ref(target)
     repo_name = _normalize_ref(repo_name)
+
     def _resolve_project_by_name(client: GitLabClient, name: str) -> dict[str, object]:
         candidates = [
             p

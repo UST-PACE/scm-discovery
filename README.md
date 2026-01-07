@@ -51,6 +51,11 @@ uv run gitlab-discovery find-large-files --repo-name group/subgroup/project --th
 uv run gitlab-discovery find-large-files portal-services --group --threshold-mb 50
 ```
   - Scans each project’s default branch under the group, writes one CSV/JSON, and lists any projects skipped for missing default branches.
+- Check if a repository uses Git LFS (flag + .gitattributes + pointer detection):
+```bash
+uv run gitlab-discovery check-lfs https://gitlab.ustpace.com/group/subgroup/repo
+```
+  - Writes `lfs_check.json` under `OUTPUT_DIR/<timestamp>/lfs-check/<repo>/` with flags and sample pointer files if found.
 - Quick repository count/listing (lightweight, read-only):
 ```bash
 uv run gitlab-discovery list-repos --root-group my-group
@@ -63,6 +68,11 @@ uv run gitlab-discovery list-repos
 uv run gitlab-discovery list-repo-urls
 ```
   - Saves `repository_urls.csv` and `repository_urls.json` under `OUTPUT_DIR/<timestamp>/repo-urls/`.
+- Find duplicate repository names (detect same repo name across projects):
+```bash
+uv run gitlab-discovery find-duplicate-repos
+```
+  - Writes `duplicate_repositories.csv` and `duplicate_repositories.json` under `OUTPUT_DIR/<timestamp>/duplicate-repos/`; defaults to membership-only, use `--all-accessible` to widen the scope.
 - All users (active by default; best-effort email + bots included):
 ```bash
 uv run gitlab-discovery list-users --include-email
