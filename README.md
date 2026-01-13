@@ -13,6 +13,9 @@ CLI to inventory GitLab SaaS groups, subgroups, and members for migration prep.
   - `GITLAB_DISCOVERY_LOG_LEVEL=INFO` (optional; set to `DEBUG` for verbose line-by-line tracing).
   - `GITLAB_DISCOVERY_DOTENV=.env` (optional; override to point at a different env file to auto-load).
   - `GITLAB_DISCOVERY_LFS_THRESHOLD_MB=100` (optional; raise/lower the Git LFS candidate threshold for repo audits).
+  - `GITLAB_DISCOVERY_SKIP_LARGE_FILES=true` (optional; default true to skip large file/LFS pointer scan).
+  - `GITLAB_DISCOVERY_LFS_CONFIG_SCAN=true` (optional; default true to scan root `.lfsconfig` when large file scan is skipped).
+  - `GITLAB_DISCOVERY_INCLUDE_CSV=false` (optional; default false to skip CSV outputs and keep HTML only).
 - Create env and install deps:
 ```bash
 uv venv
@@ -36,7 +39,7 @@ uv run gitlab-discovery audit repo all
 # Focus on a single repository
 uv run gitlab-discovery audit group/subgroup/project
 ```
-  - Outputs live under `OUTPUT_DIR/<timestamp>/repos/` and include comprehensive CSVs: repositories, large_files, project_members, project_hooks, project_integrations, pipelines, pipeline_jobs, pipeline_schedules, protected_branches, protected_tags, environments, deployments, packages, registry_repositories, registry_tags, releases, tags, ci_variables, plus `repo_summary.json` (mirrors every record) and `repo_client_report.csv`. Large files ≥ `GITLAB_DISCOVERY_LFS_THRESHOLD_MB` are flagged for Git LFS migration.
+  - Outputs live under `OUTPUT_DIR/<timestamp>/repos/` and include comprehensive CSVs: repositories (includes LFS detection flags and size stats like wiki/job artifacts), large_files, project_members, project_hooks, project_integrations, pipelines, pipeline_jobs, pipeline_schedules, protected_branches, protected_tags, environments, deployments, packages, registry_repositories, registry_tags, releases, tags, branches, ci_variables, plus `repo_summary.json` (mirrors every record) and `repo_client_report.csv`. HTML reports per repository are saved as `<repo_name>_<timestamp>.html`. Large files ≥ `GITLAB_DISCOVERY_LFS_THRESHOLD_MB` are flagged for Git LFS migration. Set `GITLAB_DISCOVERY_SKIP_LARGE_FILES=false` to enable large file/LFS pointer scanning.
 - Find large files (Git LFS prep) for a single repository:
 ```bash
 uv run gitlab-discovery find-large-files group/subgroup/project --threshold-mb 50
@@ -66,13 +69,25 @@ uv run gitlab-discovery check-rate-limit
 uv run gitlab-discovery list-repos --root-group my-group
 # or list everything you can access
 uv run gitlab-discovery list-repos
+# optional: fetch API pages in parallel
+uv run gitlab-discovery list-repos --parallel-pages 4
 ```
   - Writes a `repositories.csv` and `repositories.json` under `OUTPUT_DIR/<timestamp>/repo-list-*/` with id, path, visibility, and other metadata, and prints a count to the console.
 - Just names and URLs for all accessible repos:
 ```bash
 uv run gitlab-discovery list-repo-urls
+# optional: fetch API pages in parallel
+uv run gitlab-discovery list-repo-urls --parallel-pages 4
 ```
   - Saves `repository_urls.csv` and `repository_urls.json` under `OUTPUT_DIR/<timestamp>/repo-urls/`.
+- List groups (top-level by default, or scoped to a root group):
+```bash
+uv run gitlab-discovery list-groups
+uv run gitlab-discovery list-groups --root-group my-group --include-subgroups
+# optional: fetch API pages in parallel
+uv run gitlab-discovery list-groups --parallel-pages 4
+```
+  - Writes `groups.csv` and `groups.json` under `OUTPUT_DIR/<timestamp>/groups-*/`.
 - Find duplicate repository names (detect same repo name across projects):
 ```bash
 uv run gitlab-discovery find-duplicate-repos
@@ -90,5 +105,40 @@ uv run gitlab-discovery list-users --include-email
 - `--base-url`: GitLab instance URL (supports SaaS and self-managed, e.g., `https://gitlab.ustpace.com/`).
 - `--output`: Directory to write reports.
 - `--include-emails`: Attempt to fetch user emails and bot flag (needs admin; best effort).
+- `--parallel-pages`: Fetch multiple pages concurrently when listing repositories (>=1).
 - `audit repo all`: Repository mode covering every accessible project (finds >100 MB files for Git LFS).
 - `audit <group/project>`: Repository mode scoped to one project path or ID.
+
+## Package (single binary)
+Package the CLI into a single executable so end users do not see source files by default.
+
+### Windows (PowerShell)
+```powershell
+cd C:\source_code\ust_migration_code\scm-discovery
+uv venv
+.\.venv\Scripts\activate
+uv pip install -e .
+uv pip install pyinstaller
+
+uv run pyinstaller --name scm-discovery --onefile --console --clean `
+  --collect-all rich `
+  --collect-all dotenv `
+  -m gitlab_discovery.cli
+```
+Output: `dist\scm-discovery.exe`
+
+### WSL/Linux (zsh/bash)
+```bash
+cd /mnt/c/source_code/ust_migration_code/scm-discovery
+uv venv
+source .venv/bin/activate
+uv pip install -e .
+uv pip install pyinstaller
+
+uv run pyinstaller --name scm-discovery --onefile --console --clean \
+  --collect-all rich \
+  --collect-all dotenv \
+  -m gitlab_discovery.cli
+```
+Output: `dist/scm-discovery`
+

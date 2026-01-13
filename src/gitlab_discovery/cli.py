@@ -111,10 +111,20 @@ def list_repositories(
         envvar="OUTPUT_DIR",
         help="Directory to write repository listing CSV/JSON. Can be set via OUTPUT_DIR.",
     ),
+    parallel_pages: int = typer.Option(
+        1,
+        "--parallel-pages",
+        envvar="GITLAB_DISCOVERY_PARALLEL_PAGES",
+        help="Number of API pages to fetch concurrently (>=1). Use 1 to disable.",
+    ),
 ) -> None:
     """Count and list repositories accessible to the token (optionally scoped to a group)."""
     if not token:
         raise typer.BadParameter("GitLab token is required via --token or env GITLAB_TOKEN")
+    if parallel_pages < 1:
+        raise typer.BadParameter("--parallel-pages must be >= 1")
+
+    parallel = parallel_pages if parallel_pages > 1 else None
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     scope_dir = _safe_group_dir_name(root_group) if root_group else "all-projects"
@@ -141,11 +151,24 @@ def list_repositories(
                 group = client.get_group(root_group)
                 root_label = group.get("full_path") or group.get("path") or str(group.get("id"))
                 console.print(f"[cyan]Listing repositories under group[/] [bold]{root_label}[/] (include_subgroups={include_subgroups})")
-                projects = list(client.iter_group_projects(int(group["id"]), include_subgroups=include_subgroups))
+                projects = list(
+                    client.iter_group_projects(
+                        int(group["id"]),
+                        include_subgroups=include_subgroups,
+                        parallel_pages=parallel,
+                    )
+                )
             else:
                 root_label = "all-accessible"
                 console.print("[cyan]Listing all repositories accessible to this token.[/]")
-                projects = list(client.iter_projects(membership_only=True, include_statistics=False, simple=True))
+                projects = list(
+                    client.iter_projects(
+                        membership_only=True,
+                        include_statistics=False,
+                        simple=True,
+                        parallel_pages=parallel,
+                    )
+                )
     except GitLabAPIError as exc:
         console.print(f"[red]GitLab API error while listing repositories:[/] {exc}")
         raise typer.Exit(code=1) from exc
@@ -212,6 +235,156 @@ def list_repositories(
     console.print(f"[blue]Reports written to {run_root}[/]")
 
 
+@app.command("list-groups")
+def list_groups(
+    root_group: str | None = typer.Option(
+        None,
+        "--root-group",
+        "-g",
+        envvar="GITLAB_ROOT_GROUP",
+        help="Group id or full path to list groups under. Omit to list top-level groups.",
+    ),
+    include_subgroups: bool = typer.Option(
+        True,
+        "--include-subgroups/--no-include-subgroups",
+        help="Include subgroups recursively when listing groups.",
+    ),
+    token: str = typer.Option(
+        None,
+        "--token",
+        envvar="GITLAB_TOKEN",
+        help="GitLab personal access token with read_api scope.",
+    ),
+    base_url: str = typer.Option(
+        "https://gitlab.com",
+        "--base-url",
+        envvar="GITLAB_BASE_URL",
+        help="GitLab base URL (defaults to gitlab.com). Can be set via GITLAB_BASE_URL.",
+    ),
+    output: Path = typer.Option(
+        Path("output"),
+        "--output",
+        "-o",
+        file_okay=False,
+        dir_okay=True,
+        envvar="OUTPUT_DIR",
+        help="Directory to write group listing CSV/JSON. Can be set via OUTPUT_DIR.",
+    ),
+    parallel_pages: int = typer.Option(
+        1,
+        "--parallel-pages",
+        envvar="GITLAB_DISCOVERY_PARALLEL_PAGES",
+        help="Number of API pages to fetch concurrently (>=1). Use 1 to disable.",
+    ),
+) -> None:
+    """List accessible groups (optionally scoped to a root group)."""
+    if not token:
+        raise typer.BadParameter("GitLab token is required via --token or env GITLAB_TOKEN")
+    if parallel_pages < 1:
+        raise typer.BadParameter("--parallel-pages must be >= 1")
+
+    parallel = parallel_pages if parallel_pages > 1 else None
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    scope_dir = _safe_group_dir_name(root_group) if root_group else "top-level"
+    run_root = output / timestamp / f"groups-{scope_dir}"
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "id",
+        "name",
+        "path",
+        "full_path",
+        "visibility",
+        "web_url",
+        "parent_id",
+    ]
+
+    def _flatten_groups(
+        client: GitLabClient,
+        roots: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        collected: list[dict[str, object]] = []
+        queue = list(roots)
+        while queue:
+            group = queue.pop(0)
+            collected.append(group)
+            if not include_subgroups:
+                continue
+            for subgroup in client.iter_subgroups(int(group["id"]), parallel_pages=parallel):
+                queue.append(subgroup)
+        return collected
+
+    try:
+        with GitLabClient(base_url=base_url, token=token) as client:
+            if root_group:
+                root = client.get_group(root_group)
+                root_label = root.get("full_path") or root.get("path") or str(root.get("id"))
+                console.print(
+                    f"[cyan]Listing groups under[/] [bold]{root_label}[/] (include_subgroups={include_subgroups})"
+                )
+                groups = _flatten_groups(client, [root])
+            else:
+                console.print("[cyan]Listing top-level groups accessible to this token.[/]")
+                top_levels = list(client.iter_top_level_groups(membership_only=True, parallel_pages=parallel))
+                groups = _flatten_groups(client, top_levels)
+    except GitLabAPIError as exc:
+        console.print(f"[red]GitLab API error while listing groups:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:  # pragma: no cover - safety net
+        console.print(f"[red]Unexpected error while listing groups:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    csv_path = run_root / "groups.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for group in groups:
+            writer.writerow(
+                {
+                    "id": group.get("id"),
+                    "name": group.get("name"),
+                    "path": group.get("path"),
+                    "full_path": group.get("full_path"),
+                    "visibility": group.get("visibility"),
+                    "web_url": group.get("web_url"),
+                    "parent_id": group.get("parent_id"),
+                }
+            )
+
+    summary_path = run_root / "groups.json"
+    with summary_path.open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "root": root_group or "top-level",
+                "include_subgroups": include_subgroups,
+                "count": len(groups),
+                "groups": [
+                    {
+                        "id": group.get("id"),
+                        "name": group.get("name"),
+                        "path": group.get("path"),
+                        "full_path": group.get("full_path"),
+                        "visibility": group.get("visibility"),
+                        "web_url": group.get("web_url"),
+                        "parent_id": group.get("parent_id"),
+                    }
+                    for group in groups
+                ],
+            },
+            fh,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+
+    console.print("\n[bold green]Group listing complete.[/]")
+    console.print(f"Groups found: {len(groups)}")
+    for group in groups:
+        console.print(f"- {group.get('full_path') or group.get('path')} (id={group.get('id')})")
+    console.print(f"[blue]Reports written to {run_root}[/]")
+
+
 @app.command("list-repo-urls")
 def list_repo_urls(
     token: str = typer.Option(
@@ -240,10 +413,20 @@ def list_repo_urls(
         "--membership-only/--all-accessible",
         help="Limit to projects you are a member of (default). Disable to list all accessible projects.",
     ),
+    parallel_pages: int = typer.Option(
+        1,
+        "--parallel-pages",
+        envvar="GITLAB_DISCOVERY_PARALLEL_PAGES",
+        help="Number of API pages to fetch concurrently (>=1). Use 1 to disable.",
+    ),
 ) -> None:
     """List all accessible repositories (name + URLs only)."""
     if not token:
         raise typer.BadParameter("GitLab token is required via --token or env GITLAB_TOKEN")
+    if parallel_pages < 1:
+        raise typer.BadParameter("--parallel-pages must be >= 1")
+
+    parallel = parallel_pages if parallel_pages > 1 else None
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     run_root = output / timestamp / "repo-urls"
@@ -267,6 +450,7 @@ def list_repo_urls(
                     membership_only=membership_only,
                     include_statistics=False,
                     simple=True,
+                    parallel_pages=parallel,
                 )
             )
     except GitLabAPIError as exc:
@@ -1211,7 +1395,28 @@ def _run_repo_audit(
     output_root: Path,
     console: Console,
 ) -> None:
-    scope = repo_scope or "all"
+    scope = _normalize_ref(repo_scope) or "all"
+    tree_parallel_raw = os.getenv("GITLAB_DISCOVERY_TREE_PARALLEL_PAGES", "4").strip()
+    tree_parallel_pages: int | None = None
+    try:
+        value = int(tree_parallel_raw)
+        if value < 1:
+            raise ValueError("GITLAB_DISCOVERY_TREE_PARALLEL_PAGES must be >= 1")
+        tree_parallel_pages = value if value > 1 else None
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    skip_large_files_raw = os.getenv("GITLAB_DISCOVERY_SKIP_LARGE_FILES", "true").strip().lower()
+    if skip_large_files_raw not in {"true", "false", "1", "0", "yes", "no"}:
+        raise typer.BadParameter("GITLAB_DISCOVERY_SKIP_LARGE_FILES must be true/false")
+    skip_large_file_scan = skip_large_files_raw in {"true", "1", "yes"}
+    lfs_config_scan_raw = os.getenv("GITLAB_DISCOVERY_LFS_CONFIG_SCAN", "true").strip().lower()
+    if lfs_config_scan_raw not in {"true", "false", "1", "0", "yes", "no"}:
+        raise typer.BadParameter("GITLAB_DISCOVERY_LFS_CONFIG_SCAN must be true/false")
+    lfs_config_scan = lfs_config_scan_raw in {"true", "1", "yes"}
+    include_csv_raw = os.getenv("GITLAB_DISCOVERY_INCLUDE_CSV", "false").strip().lower()
+    if include_csv_raw not in {"true", "false", "1", "0", "yes", "no"}:
+        raise typer.BadParameter("GITLAB_DISCOVERY_INCLUDE_CSV must be true/false")
+    include_csv = include_csv_raw in {"true", "1", "yes"}
     repo_output = output_root / "repos"
     try:
         with GitLabClient(base_url=base_url, token=token) as client:
@@ -1240,6 +1445,10 @@ def _run_repo_audit(
                 output_dir=repo_output,
                 console=console,
                 lfs_threshold_bytes=LFS_THRESHOLD_BYTES,
+                tree_parallel_pages=tree_parallel_pages,
+                skip_large_file_scan=skip_large_file_scan,
+                lfs_config_scan=lfs_config_scan,
+                include_csv=include_csv,
             )
     except typer.Exit:
         raise
@@ -1254,7 +1463,10 @@ def _run_repo_audit(
     console.print(
         f"Repositories: {repo_result.summary['projects']}, Large files >= {LFS_THRESHOLD_MB} MB: {repo_result.summary['large_files']}"
     )
-    console.print(f"Combined CSV for client: {repo_result.combined_csv}")
+    if repo_result.summary.get("csv_enabled"):
+        console.print(f"Combined CSV for client: {repo_result.combined_csv}")
+    else:
+        console.print("CSV outputs disabled (set GITLAB_DISCOVERY_INCLUDE_CSV=true to enable).")
     console.print(f"[blue]Run artifacts saved under {output_root}[/]")
 
 

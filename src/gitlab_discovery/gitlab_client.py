@@ -112,60 +112,117 @@ class GitLabClient:
         self,
         path: str,
         params: dict[str, t.Any] | None = None,
+        parallel_pages: int | None = None,
     ) -> t.Iterator[dict[str, t.Any]]:
         page = 1
         params = params or {}
-        while True:
-            page_params = {**params, "page": page, "per_page": 100}
-            response = self._request("GET", path, params=page_params)
-            items = response.json()
-            if not isinstance(items, list):
-                raise GitLabAPIError(f"Expected list response for {path}")
-            for item in items:
-                yield item
-            next_page = response.headers.get("X-Next-Page")
-            if not next_page:
-                break
-            page = int(next_page)
+        page_params = {**params, "page": page, "per_page": 100}
+        response = self._request("GET", path, params=page_params)
+        items = response.json()
+        if not isinstance(items, list):
+            raise GitLabAPIError(f"Expected list response for {path}")
+        for item in items:
+            yield item
+
+        total_pages_raw = response.headers.get("X-Total-Pages")
+        total_pages: int | None = None
+        if total_pages_raw:
+            try:
+                total_pages = int(total_pages_raw)
+            except ValueError:
+                total_pages = None
+
+        if total_pages and total_pages > 1 and parallel_pages is not None and parallel_pages > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            max_workers = min(parallel_pages, total_pages - 1)
+
+            def _fetch_page(page_num: int) -> list[dict[str, t.Any]]:
+                page_params = {**params, "page": page_num, "per_page": 100}
+                page_response = self._request("GET", path, params=page_params)
+                page_items = page_response.json()
+                if not isinstance(page_items, list):
+                    raise GitLabAPIError(f"Expected list response for {path}")
+                return page_items
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(_fetch_page, page_num): page_num
+                    for page_num in range(2, total_pages + 1)
+                }
+                for future in as_completed(futures):
+                    for item in future.result():
+                        yield item
+        else:
+            while True:
+                page = int(response.headers.get("X-Next-Page") or 0)
+                if not page:
+                    break
+                page_params = {**params, "page": page, "per_page": 100}
+                response = self._request("GET", path, params=page_params)
+                items = response.json()
+                if not isinstance(items, list):
+                    raise GitLabAPIError(f"Expected list response for {path}")
+                for item in items:
+                    yield item
 
     def get_group(self, ref: str | int) -> dict[str, t.Any]:
         ref_enc = _encode_group_ref(ref)
         response = self._request("GET", f"/groups/{ref_enc}")
         return response.json()
 
-    def iter_subgroups(self, group_id: int) -> t.Iterator[dict[str, t.Any]]:
+    def iter_subgroups(
+        self,
+        group_id: int,
+        parallel_pages: int | None = None,
+    ) -> t.Iterator[dict[str, t.Any]]:
         return self._paginate(
             f"/groups/{group_id}/subgroups",
             params={"with_projects": False},
+            parallel_pages=parallel_pages,
         )
 
     def iter_group_projects(
         self,
         group_id: int,
         include_subgroups: bool = False,
+        parallel_pages: int | None = None,
     ) -> t.Iterator[dict[str, t.Any]]:
         params: dict[str, t.Any] = {
             "include_subgroups": include_subgroups,
             "with_shared": False,
         }
-        return self._paginate(f"/groups/{group_id}/projects", params=params)
+        return self._paginate(
+            f"/groups/{group_id}/projects",
+            params=params,
+            parallel_pages=parallel_pages,
+        )
 
     def iter_group_projects(
         self,
         group_id: int,
         include_subgroups: bool = False,
+        parallel_pages: int | None = None,
     ) -> t.Iterator[dict[str, t.Any]]:
         params: dict[str, t.Any] = {
             "include_subgroups": include_subgroups,
             "with_shared": False,
         }
-        return self._paginate(f"/groups/{group_id}/projects", params=params)
+        return self._paginate(
+            f"/groups/{group_id}/projects",
+            params=params,
+            parallel_pages=parallel_pages,
+        )
 
-    def iter_top_level_groups(self, membership_only: bool = True) -> t.Iterator[dict[str, t.Any]]:
+    def iter_top_level_groups(
+        self,
+        membership_only: bool = True,
+        parallel_pages: int | None = None,
+    ) -> t.Iterator[dict[str, t.Any]]:
         params: dict[str, t.Any] = {"top_level_only": True}
         if membership_only:
             params["membership"] = True
-        return self._paginate("/groups", params=params)
+        return self._paginate("/groups", params=params, parallel_pages=parallel_pages)
 
     def iter_users(
         self,
@@ -204,6 +261,7 @@ class GitLabClient:
         include_statistics: bool = True,
         simple: bool = False,
         search: str | None = None,
+        parallel_pages: int | None = None,
     ) -> t.Iterator[dict[str, t.Any]]:
         params: dict[str, t.Any] = {
             "order_by": "path",
@@ -217,7 +275,7 @@ class GitLabClient:
             params["simple"] = True
         if search:
             params["search"] = search
-        return self._paginate("/projects", params=params)
+        return self._paginate("/projects", params=params, parallel_pages=parallel_pages)
 
     def get_project(self, ref: str | int, include_statistics: bool = True) -> dict[str, t.Any]:
         ref_enc = _encode_project_ref(ref)
@@ -230,12 +288,17 @@ class GitLabClient:
         project_id: int,
         ref: str,
         recursive: bool = True,
+        parallel_pages: int | None = None,
     ) -> t.Iterator[dict[str, t.Any]]:
         params = {
             "ref": ref,
             "recursive": recursive,
         }
-        return self._paginate(f"/projects/{project_id}/repository/tree", params=params)
+        return self._paginate(
+            f"/projects/{project_id}/repository/tree",
+            params=params,
+            parallel_pages=parallel_pages,
+        )
 
     def get_blob(self, project_id: int, blob_sha: str) -> dict[str, t.Any]:
         response = self._request("GET", f"/projects/{project_id}/repository/blobs/{blob_sha}")
@@ -275,6 +338,9 @@ class GitLabClient:
     def iter_project_tags(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
         return self._paginate(f"/projects/{project_id}/repository/tags")
 
+    def iter_project_branches(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
+        return self._paginate(f"/projects/{project_id}/repository/branches")
+
     def iter_project_protected_branches(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
         return self._paginate(f"/projects/{project_id}/protected_branches")
 
@@ -303,6 +369,21 @@ class GitLabClient:
         if not isinstance(payload, list):
             raise GitLabAPIError("Expected registry tags list response")
         return payload
+
+    def get_list_total(
+        self,
+        path: str,
+        params: dict[str, t.Any] | None = None,
+    ) -> int:
+        page_params = {**(params or {}), "page": 1, "per_page": 1}
+        response = self._request("GET", path, params=page_params)
+        total = response.headers.get("X-Total")
+        if total and str(total).isdigit():
+            return int(total)
+        payload = response.json()
+        if isinstance(payload, list):
+            return len(payload)
+        return 0
 
     def iter_project_variables(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
         return self._paginate(f"/projects/{project_id}/variables")
