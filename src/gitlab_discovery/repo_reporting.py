@@ -68,6 +68,7 @@ class LargeFileReport:
     size_bytes: int
     size_mb: float
     blob_sha: str
+    branch: str | None = None
 
 
 @dataclass
@@ -450,6 +451,7 @@ def audit_repositories(
                                     size_bytes=size,
                                     size_mb=round(size / (1024 * 1024), 2),
                                     blob_sha=blob_sha,
+                                    branch=default_branch,
                                 )
                             )
             elif lfs_config_scan and default_branch:
@@ -616,7 +618,7 @@ def audit_repositories(
         )
         _write_csv_if_rows(
             output_dir / "large_files.csv",
-            ["project_id", "project_path", "file_path", "size_bytes", "size_mb", "blob_sha"],
+            ["project_id", "project_path", "branch", "file_path", "size_bytes", "size_mb", "blob_sha"],
             (asdict(l) for l in large_files),
             bool(large_files),
         )

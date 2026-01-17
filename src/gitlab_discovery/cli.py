@@ -7,6 +7,8 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import csv
 import json
+import re
+import subprocess
 from dataclasses import asdict
 from urllib.parse import urlparse
 from collections import defaultdict
@@ -56,6 +58,136 @@ def _normalize_ref(ref: str | None) -> str | None:
             path = path[:-4]
         return path
     return ref.strip()
+
+
+def _mb_from_bytes(value: int | float | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return round(float(value) / (1024 * 1024), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _run_git_command(
+    args: list[str],
+    cwd: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> str:
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    result = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or "git command failed"
+        raise RuntimeError(f"git {' '.join(args)} failed: {stderr}")
+    return result.stdout
+
+
+def _mirror_path_for_repo(mirror_root: Path, repo_url: str) -> Path:
+    parsed = urlparse(repo_url)
+    host = parsed.netloc or "gitlab"
+    path = parsed.path.lstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    path_parts = [part for part in path.split("/") if part]
+    mirror_dir = mirror_root / host
+    if path_parts:
+        mirror_dir = mirror_dir / Path(*path_parts)
+    return mirror_dir.with_suffix(".git")
+
+
+def _ensure_mirror(mirror_dir: Path, repo_url: str) -> None:
+    if mirror_dir.exists():
+        return
+    mirror_dir.parent.mkdir(parents=True, exist_ok=True)
+    extra_env = {"GIT_TERMINAL_PROMPT": "0"}
+    token = os.getenv("GITLAB_TOKEN")
+    if token and repo_url.startswith("http"):
+        extra_env["GIT_HTTP_EXTRA_HEADER"] = f"PRIVATE-TOKEN: {token}"
+    _run_git_command(["clone", "--mirror", repo_url, str(mirror_dir)], extra_env=extra_env)
+
+
+def _get_mirror_branches(
+    mirror_dir: Path,
+    all_branches: bool,
+    default_branch: str | None,
+) -> list[str]:
+    if all_branches:
+        output = _run_git_command(["for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd=mirror_dir)
+        return [line.strip() for line in output.splitlines() if line.strip()]
+    if default_branch:
+        return [default_branch]
+    try:
+        head_ref = _run_git_command(["symbolic-ref", "HEAD"], cwd=mirror_dir).strip()
+    except RuntimeError:
+        head_ref = ""
+    if head_ref.startswith("refs/heads/"):
+        head_ref = head_ref[len("refs/heads/") :]
+    if head_ref:
+        return [head_ref]
+    output = _run_git_command(["for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd=mirror_dir)
+    branches = [line.strip() for line in output.splitlines() if line.strip()]
+    return branches[:1]
+
+
+def _iter_large_blobs_in_history(
+    mirror_dir: Path,
+    branch: str,
+    threshold_bytes: int,
+) -> list[tuple[str, int, str]]:
+    rev_proc = subprocess.Popen(
+        ["git", "rev-list", "--objects", branch],
+        cwd=str(mirror_dir),
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    cat_proc = subprocess.Popen(
+        [
+            "git",
+            "cat-file",
+            "--batch-check=%(objecttype) %(objectsize) %(objectname) %(rest)",
+        ],
+        cwd=str(mirror_dir),
+        stdin=rev_proc.stdout,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    if rev_proc.stdout:
+        rev_proc.stdout.close()
+    if not cat_proc.stdout:
+        raise RuntimeError("git cat-file produced no output")
+    results: list[tuple[str, int, str]] = []
+    for line in cat_proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(" ", 3)
+        if len(parts) < 4:
+            continue
+        obj_type, size_raw, sha, path = parts
+        if obj_type != "blob":
+            continue
+        try:
+            size = int(size_raw)
+        except ValueError:
+            continue
+        if size < threshold_bytes:
+            continue
+        results.append((sha, size, path))
+    cat_proc.wait()
+    rev_proc.wait()
+    if cat_proc.returncode != 0:
+        raise RuntimeError("git cat-file failed while scanning history")
+    if rev_proc.returncode != 0:
+        raise RuntimeError("git rev-list failed while scanning history")
+    return results
 
 
 @app.command("features")
@@ -232,6 +364,813 @@ def list_repositories(
     console.print(f"Repositories found: {len(projects)}")
     for repo in projects:
         console.print(f"- {repo.get('path_with_namespace') or repo.get('path')} (id={repo.get('id')}, visibility={repo.get('visibility')})")
+    console.print(f"[blue]Reports written to {run_root}[/]")
+
+
+@app.command("list-large-repos")
+def list_large_repositories(
+    root_group: str | None = typer.Option(
+        None,
+        "--root-group",
+        "-g",
+        envvar="GITLAB_ROOT_GROUP",
+        help="Group id or full path to list repositories under. Omit to list every accessible repository.",
+    ),
+    all_top_groups: bool = typer.Option(
+        False,
+        "--all-top-groups",
+        help="List repositories under every top-level group you can access.",
+    ),
+    include_subgroups: bool = typer.Option(
+        True,
+        "--include-subgroups/--no-include-subgroups",
+        help="When using --root-group, include repositories from all nested subgroups.",
+    ),
+    token: str = typer.Option(
+        None,
+        "--token",
+        envvar="GITLAB_TOKEN",
+        help="GitLab personal access token with read_api scope.",
+    ),
+    base_url: str = typer.Option(
+        "https://gitlab.com",
+        "--base-url",
+        envvar="GITLAB_BASE_URL",
+        help="GitLab base URL (defaults to gitlab.com). Can be set via GITLAB_BASE_URL.",
+    ),
+    output: Path = typer.Option(
+        Path("output"),
+        "--output",
+        "-o",
+        file_okay=False,
+        dir_okay=True,
+        envvar="OUTPUT_DIR",
+        help="Directory to write repository listing CSV/JSON. Can be set via OUTPUT_DIR.",
+    ),
+    parallel_pages: int = typer.Option(
+        1,
+        "--parallel-pages",
+        envvar="GITLAB_DISCOVERY_PARALLEL_PAGES",
+        help="Number of API pages to fetch concurrently (>=1). Use 1 to disable.",
+    ),
+    min_repo_mb: float = typer.Option(
+        10.0,
+        "--min-repo-mb",
+        help="Minimum repository size in MB to include (uses repository_size from statistics).",
+    ),
+    size_field: str = typer.Option(
+        "storage_size",
+        "--size-field",
+        help="Statistics field to filter on: repository_size, storage_size, lfs_objects_size, packages_size, wiki_size, job_artifacts_size.",
+    ),
+    resolve_stats: bool = typer.Option(
+        True,
+        "--resolve-stats/--no-resolve-stats",
+        help="Fetch per-project statistics when missing from list endpoints (slower).",
+    ),
+) -> None:
+    """List repositories larger than the given size threshold (based on repository_size statistics)."""
+    if not token:
+        raise typer.BadParameter("GitLab token is required via --token or env GITLAB_TOKEN")
+    if parallel_pages < 1:
+        raise typer.BadParameter("--parallel-pages must be >= 1")
+    if min_repo_mb <= 0:
+        raise typer.BadParameter("--min-repo-mb must be positive")
+    if root_group and all_top_groups:
+        raise typer.BadParameter("--root-group cannot be combined with --all-top-groups")
+
+    size_field = size_field.strip().lower()
+    size_fields = {
+        "repository_size": "repository_size",
+        "storage_size": "storage_size",
+        "lfs_objects_size": "lfs_objects_size",
+        "packages_size": "packages_size",
+        "wiki_size": "wiki_size",
+        "job_artifacts_size": "job_artifacts_size",
+    }
+    if size_field not in size_fields:
+        raise typer.BadParameter(
+            "--size-field must be one of: repository_size, storage_size, lfs_objects_size, packages_size, wiki_size, job_artifacts_size"
+        )
+    size_key = size_fields[size_field]
+
+    parallel = parallel_pages if parallel_pages > 1 else None
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    if all_top_groups:
+        scope_dir = "all-top-groups"
+    else:
+        scope_dir = _safe_group_dir_name(root_group) if root_group else "all-projects"
+    run_root = output / timestamp / f"large-repos-{scope_dir}"
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "id",
+        "name",
+        "path_with_namespace",
+        "visibility",
+        "web_url",
+        "archived",
+        "empty_repo",
+        "default_branch",
+        "last_activity_at",
+        "created_at",
+        "namespace_full_path",
+        "repository_size_mb",
+        "storage_size_mb",
+        "lfs_objects_size_mb",
+        "packages_size_mb",
+        "wiki_size_mb",
+        "job_artifacts_size_mb",
+    ]
+
+    threshold_bytes = int(min_repo_mb * 1024 * 1024)
+    results: list[dict[str, object]] = []
+    total_projects = 0
+    missing_stats = 0
+    missing_size_field = 0
+    stats_fetch_errors: list[dict[str, str]] = []
+
+    group_labels: list[str] = []
+    try:
+        with GitLabClient(base_url=base_url, token=token) as client:
+            if root_group:
+                group = client.get_group(root_group)
+                root_label = group.get("full_path") or group.get("path") or str(group.get("id"))
+                console.print(
+                    f"[cyan]Listing repositories under group[/] [bold]{root_label}[/] "
+                    f"(include_subgroups={include_subgroups}, min_repo_mb={min_repo_mb})."
+                )
+                projects = list(
+                    client.iter_group_projects(
+                        int(group["id"]),
+                        include_subgroups=include_subgroups,
+                        include_statistics=True,
+                        parallel_pages=parallel,
+                    )
+                )
+            elif all_top_groups:
+                console.print(
+                    f"[cyan]Listing repositories under all top-level groups[/] "
+                    f"(include_subgroups={include_subgroups}, min_repo_mb={min_repo_mb})."
+                )
+                groups = list(client.iter_top_level_groups(membership_only=True, parallel_pages=parallel))
+                seen_project_ids: set[int] = set()
+                projects = []
+                for group in groups:
+                    group_id = int(group["id"])
+                    group_label = group.get("full_path") or group.get("path") or str(group_id)
+                    group_labels.append(group_label)
+                    for project in client.iter_group_projects(
+                        group_id,
+                        include_subgroups=include_subgroups,
+                        include_statistics=True,
+                        parallel_pages=parallel,
+                    ):
+                        project_id = int(project.get("id") or 0)
+                        if project_id and project_id in seen_project_ids:
+                            continue
+                        if project_id:
+                            seen_project_ids.add(project_id)
+                        projects.append(project)
+            else:
+                root_label = "all-accessible"
+                console.print(f"[cyan]Listing all repositories >= {min_repo_mb} MB accessible to this token.[/]")
+                projects = list(
+                    client.iter_projects(
+                        membership_only=True,
+                        include_statistics=True,
+                        simple=False,
+                        parallel_pages=parallel,
+                    )
+                )
+
+            for repo in projects:
+                total_projects += 1
+                stats = repo.get("statistics") or {}
+                size_value = stats.get(size_key)
+                if size_value is None:
+                    missing_stats += 1
+                    if resolve_stats:
+                        project_id = int(repo.get("id") or 0)
+                        if project_id:
+                            try:
+                                detail = client.get_project(project_id, include_statistics=True)
+                                stats = detail.get("statistics") or {}
+                                size_value = stats.get(size_key)
+                            except GitLabAPIError as exc:
+                                stats_fetch_errors.append({"project": str(project_id), "error": str(exc)})
+                if size_value is None:
+                    missing_size_field += 1
+                    continue
+                try:
+                    repo_size_bytes = int(size_value)
+                except (TypeError, ValueError):
+                    missing_size_field += 1
+                    continue
+                if repo_size_bytes < threshold_bytes:
+                    continue
+                namespace = repo.get("namespace") or {}
+                results.append(
+                    {
+                        "id": repo.get("id"),
+                        "name": repo.get("name"),
+                        "path_with_namespace": repo.get("path_with_namespace") or repo.get("path"),
+                        "visibility": repo.get("visibility"),
+                        "web_url": repo.get("web_url"),
+                        "archived": repo.get("archived"),
+                        "empty_repo": repo.get("empty_repo"),
+                        "default_branch": repo.get("default_branch"),
+                        "last_activity_at": repo.get("last_activity_at"),
+                        "created_at": repo.get("created_at"),
+                        "namespace_full_path": namespace.get("full_path"),
+                        "repository_size_mb": _mb_from_bytes(stats.get("repository_size")),
+                        "storage_size_mb": _mb_from_bytes(stats.get("storage_size")),
+                        "lfs_objects_size_mb": _mb_from_bytes(stats.get("lfs_objects_size")),
+                        "packages_size_mb": _mb_from_bytes(stats.get("packages_size")),
+                        "wiki_size_mb": _mb_from_bytes(stats.get("wiki_size")),
+                        "job_artifacts_size_mb": _mb_from_bytes(stats.get("job_artifacts_size")),
+                    }
+                )
+    except GitLabAPIError as exc:
+        console.print(f"[red]GitLab API error while listing repositories:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:  # pragma: no cover - safety net
+        console.print(f"[red]Unexpected error while listing repositories:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    results.sort(key=lambda item: float(item.get("repository_size_mb") or 0), reverse=True)
+
+    csv_path = run_root / "large_repositories.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for repo in results:
+            writer.writerow(repo)
+
+    summary_path = run_root / "large_repositories.json"
+    with summary_path.open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "root_group": root_group,
+                "all_top_groups": all_top_groups,
+                "top_groups": group_labels,
+                "min_repo_mb": min_repo_mb,
+                "size_field": size_key,
+                "resolve_stats": resolve_stats,
+                "count": len(results),
+                "total_projects": total_projects,
+                "missing_statistics": missing_stats,
+                "missing_size_field": missing_size_field,
+                "stats_fetch_errors": stats_fetch_errors,
+                "repositories": results,
+            },
+            fh,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+
+    console.print("\n[bold green]Large repository listing complete.[/]")
+    console.print(f"Repositories found: {len(results)} (>= {min_repo_mb} MB)")
+    if missing_stats:
+        console.print(
+            f"[yellow]Missing statistics for {missing_stats}/{total_projects} repositories "
+            f"(size_field={size_key}, resolve_stats={resolve_stats}).[/]"
+        )
+    if stats_fetch_errors:
+        console.print(f"[yellow]Statistics fetch errors: {len(stats_fetch_errors)} (see large_repositories.json).[/]")
+    console.print(f"[blue]Reports written to {run_root}[/]")
+
+
+@app.command("list-large-mrs")
+def list_large_merge_requests(
+    root_group: str | None = typer.Option(
+        None,
+        "--root-group",
+        "-g",
+        envvar="GITLAB_ROOT_GROUP",
+        help="Group id or full path to list repositories under. Omit to list every accessible repository.",
+    ),
+    all_top_groups: bool = typer.Option(
+        False,
+        "--all-top-groups",
+        help="List repositories under every top-level group you can access.",
+    ),
+    include_subgroups: bool = typer.Option(
+        True,
+        "--include-subgroups/--no-include-subgroups",
+        help="When using --root-group, include repositories from all nested subgroups.",
+    ),
+    token: str = typer.Option(
+        None,
+        "--token",
+        envvar="GITLAB_TOKEN",
+        help="GitLab personal access token with read_api scope.",
+    ),
+    base_url: str = typer.Option(
+        "https://gitlab.com",
+        "--base-url",
+        envvar="GITLAB_BASE_URL",
+        help="GitLab base URL (defaults to gitlab.com). Can be set via GITLAB_BASE_URL.",
+    ),
+    output: Path = typer.Option(
+        Path("output"),
+        "--output",
+        "-o",
+        file_okay=False,
+        dir_okay=True,
+        envvar="OUTPUT_DIR",
+        help="Directory to write repository listing CSV/JSON. Can be set via OUTPUT_DIR.",
+    ),
+    parallel_pages: int = typer.Option(
+        1,
+        "--parallel-pages",
+        envvar="GITLAB_DISCOVERY_PARALLEL_PAGES",
+        help="Number of API pages to fetch concurrently (>=1). Use 1 to disable.",
+    ),
+    min_open_mrs: int = typer.Option(
+        100,
+        "--min-open-mrs",
+        help="Minimum number of open merge requests to include.",
+    ),
+) -> None:
+    """List repositories with a large number of open merge requests."""
+    if not token:
+        raise typer.BadParameter("GitLab token is required via --token or env GITLAB_TOKEN")
+    if parallel_pages < 1:
+        raise typer.BadParameter("--parallel-pages must be >= 1")
+    if min_open_mrs < 0:
+        raise typer.BadParameter("--min-open-mrs must be >= 0")
+    if root_group and all_top_groups:
+        raise typer.BadParameter("--root-group cannot be combined with --all-top-groups")
+
+    parallel = parallel_pages if parallel_pages > 1 else None
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    if all_top_groups:
+        scope_dir = "all-top-groups"
+    else:
+        scope_dir = _safe_group_dir_name(root_group) if root_group else "all-projects"
+    run_root = output / timestamp / f"large-mrs-{scope_dir}"
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "id",
+        "name",
+        "path_with_namespace",
+        "visibility",
+        "web_url",
+        "archived",
+        "default_branch",
+        "namespace_full_path",
+        "open_merge_requests",
+    ]
+
+    results: list[dict[str, object]] = []
+    errors: list[dict[str, str]] = []
+    group_labels: list[str] = []
+
+    try:
+        with GitLabClient(base_url=base_url, token=token) as client:
+            if root_group:
+                group = client.get_group(root_group)
+                root_label = group.get("full_path") or group.get("path") or str(group.get("id"))
+                console.print(
+                    f"[cyan]Checking open merge requests under group[/] [bold]{root_label}[/] "
+                    f"(include_subgroups={include_subgroups}, min_open_mrs={min_open_mrs})."
+                )
+                projects = list(
+                    client.iter_group_projects(
+                        int(group["id"]),
+                        include_subgroups=include_subgroups,
+                        parallel_pages=parallel,
+                    )
+                )
+            elif all_top_groups:
+                console.print(
+                    f"[cyan]Checking open merge requests under all top-level groups[/] "
+                    f"(include_subgroups={include_subgroups}, min_open_mrs={min_open_mrs})."
+                )
+                groups = list(client.iter_top_level_groups(membership_only=True, parallel_pages=parallel))
+                seen_project_ids: set[int] = set()
+                projects = []
+                for group in groups:
+                    group_id = int(group["id"])
+                    group_label = group.get("full_path") or group.get("path") or str(group_id)
+                    group_labels.append(group_label)
+                    for project in client.iter_group_projects(
+                        group_id,
+                        include_subgroups=include_subgroups,
+                        parallel_pages=parallel,
+                    ):
+                        project_id = int(project.get("id") or 0)
+                        if project_id and project_id in seen_project_ids:
+                            continue
+                        if project_id:
+                            seen_project_ids.add(project_id)
+                        projects.append(project)
+            else:
+                console.print(
+                    f"[cyan]Checking open merge requests for all accessible repositories "
+                    f"(min_open_mrs={min_open_mrs}).[/]"
+                )
+                projects = list(
+                    client.iter_projects(
+                        membership_only=True,
+                        include_statistics=False,
+                        simple=True,
+                        parallel_pages=parallel,
+                    )
+                )
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                transient=False,
+                console=console,
+            ) as progress:
+                task = progress.add_task("Counting open merge requests...", total=len(projects))
+                for project in projects:
+                    project_id = int(project.get("id") or 0)
+                    project_path = project.get("path_with_namespace") or project.get("path") or str(project_id)
+                    try:
+                        open_mrs = client.get_list_total(
+                            f"/projects/{project_id}/merge_requests",
+                            params={"state": "opened"},
+                        )
+                    except GitLabAPIError as exc:
+                        errors.append({"project": project_path, "error": str(exc)})
+                        progress.advance(task, 1)
+                        continue
+                    if open_mrs >= min_open_mrs:
+                        namespace = project.get("namespace") or {}
+                        results.append(
+                            {
+                                "id": project.get("id"),
+                                "name": project.get("name"),
+                                "path_with_namespace": project.get("path_with_namespace") or project.get("path"),
+                                "visibility": project.get("visibility"),
+                                "web_url": project.get("web_url"),
+                                "archived": project.get("archived"),
+                                "default_branch": project.get("default_branch"),
+                                "namespace_full_path": namespace.get("full_path"),
+                                "open_merge_requests": open_mrs,
+                            }
+                        )
+                    progress.advance(task, 1)
+    except GitLabAPIError as exc:
+        console.print(f"[red]GitLab API error while listing repositories:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:  # pragma: no cover - safety net
+        console.print(f"[red]Unexpected error while listing repositories:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    results.sort(key=lambda item: int(item.get("open_merge_requests") or 0), reverse=True)
+
+    csv_path = run_root / "large_merge_requests.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for repo in results:
+            writer.writerow(repo)
+
+    summary_path = run_root / "large_merge_requests.json"
+    with summary_path.open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "root_group": root_group,
+                "all_top_groups": all_top_groups,
+                "top_groups": group_labels,
+                "min_open_mrs": min_open_mrs,
+                "count": len(results),
+                "total_projects": len(projects),
+                "errors": errors,
+                "repositories": results,
+            },
+            fh,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+
+    console.print("\n[bold green]Large merge request listing complete.[/]")
+    console.print(f"Repositories found: {len(results)} (>= {min_open_mrs} open MRs)")
+    if errors:
+        console.print(f"[yellow]MR count errors: {len(errors)} (see large_merge_requests.json).[/]")
+    console.print(f"[blue]Reports written to {run_root}[/]")
+
+
+@app.command("list-open-mrs")
+def list_open_merge_requests(
+    root_group: str | None = typer.Option(
+        None,
+        "--root-group",
+        "-g",
+        envvar="GITLAB_ROOT_GROUP",
+        help="Group id or full path to list repositories under. Omit to list every accessible repository.",
+    ),
+    all_top_groups: bool = typer.Option(
+        False,
+        "--all-top-groups",
+        help="List repositories under every top-level group you can access.",
+    ),
+    include_subgroups: bool = typer.Option(
+        True,
+        "--include-subgroups/--no-include-subgroups",
+        help="When using --root-group, include repositories from all nested subgroups.",
+    ),
+    repo_name: str | None = typer.Option(
+        None,
+        "--repo-name",
+        help="Limit results to a single repository path/ID.",
+    ),
+    token: str = typer.Option(
+        None,
+        "--token",
+        envvar="GITLAB_TOKEN",
+        help="GitLab personal access token with read_api scope.",
+    ),
+    base_url: str = typer.Option(
+        "https://gitlab.com",
+        "--base-url",
+        envvar="GITLAB_BASE_URL",
+        help="GitLab base URL (defaults to gitlab.com). Can be set via GITLAB_BASE_URL.",
+    ),
+    output: Path = typer.Option(
+        Path("output"),
+        "--output",
+        "-o",
+        file_okay=False,
+        dir_okay=True,
+        envvar="OUTPUT_DIR",
+        help="Directory to write MR listing CSV/JSON. Can be set via OUTPUT_DIR.",
+    ),
+    parallel_pages: int = typer.Option(
+        1,
+        "--parallel-pages",
+        envvar="GITLAB_DISCOVERY_PARALLEL_PAGES",
+        help="Number of API pages to fetch concurrently (>=1). Use 1 to disable.",
+    ),
+    min_comments: int = typer.Option(
+        0,
+        "--min-comments",
+        help="Minimum number of comments (user notes) to include.",
+    ),
+    summary: bool = typer.Option(
+        False,
+        "--summary",
+        help="Write a repo-level summary CSV/JSON (totals per repository).",
+    ),
+    summary_only: bool = typer.Option(
+        False,
+        "--summary-only",
+        help="Only write the repo-level summary (implies --summary).",
+    ),
+) -> None:
+    """List open merge requests with comment counts (user notes)."""
+    if not token:
+        raise typer.BadParameter("GitLab token is required via --token or env GITLAB_TOKEN")
+    if parallel_pages < 1:
+        raise typer.BadParameter("--parallel-pages must be >= 1")
+    if min_comments < 0:
+        raise typer.BadParameter("--min-comments must be >= 0")
+    if root_group and all_top_groups:
+        raise typer.BadParameter("--root-group cannot be combined with --all-top-groups")
+    if summary_only:
+        summary = True
+
+    parallel = parallel_pages if parallel_pages > 1 else None
+    repo_filter = _normalize_ref(repo_name)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    if all_top_groups:
+        scope_dir = "all-top-groups"
+    else:
+        scope_dir = _safe_group_dir_name(root_group) if root_group else "all-projects"
+    run_root = output / timestamp / f"open-mrs-{scope_dir}"
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "project_id",
+        "project_path",
+        "mr_id",
+        "mr_iid",
+        "title",
+        "state",
+        "web_url",
+        "author_username",
+        "created_at",
+        "updated_at",
+        "comments",
+    ]
+
+    results: list[dict[str, object]] = []
+    summary_rows: list[dict[str, object]] = []
+    errors: list[dict[str, str]] = []
+    group_labels: list[str] = []
+    total_projects = 0
+    total_mrs = 0
+
+    try:
+        with GitLabClient(base_url=base_url, token=token) as client:
+            if root_group:
+                group = client.get_group(root_group)
+                root_label = group.get("full_path") or group.get("path") or str(group.get("id"))
+                console.print(
+                    f"[cyan]Listing open merge requests under group[/] [bold]{root_label}[/] "
+                    f"(include_subgroups={include_subgroups}, min_comments={min_comments})."
+                )
+                projects = list(
+                    client.iter_group_projects(
+                        int(group["id"]),
+                        include_subgroups=include_subgroups,
+                        parallel_pages=parallel,
+                    )
+                )
+            elif all_top_groups:
+                console.print(
+                    f"[cyan]Listing open merge requests under all top-level groups[/] "
+                    f"(include_subgroups={include_subgroups}, min_comments={min_comments})."
+                )
+                groups = list(client.iter_top_level_groups(membership_only=True, parallel_pages=parallel))
+                seen_project_ids: set[int] = set()
+                projects = []
+                for group in groups:
+                    group_id = int(group["id"])
+                    group_label = group.get("full_path") or group.get("path") or str(group_id)
+                    group_labels.append(group_label)
+                    for project in client.iter_group_projects(
+                        group_id,
+                        include_subgroups=include_subgroups,
+                        parallel_pages=parallel,
+                    ):
+                        project_id = int(project.get("id") or 0)
+                        if project_id and project_id in seen_project_ids:
+                            continue
+                        if project_id:
+                            seen_project_ids.add(project_id)
+                        projects.append(project)
+            else:
+                console.print(
+                    f"[cyan]Listing open merge requests for all accessible repositories "
+                    f"(min_comments={min_comments}).[/]"
+                )
+                projects = list(
+                    client.iter_projects(
+                        membership_only=True,
+                        include_statistics=False,
+                        simple=True,
+                        parallel_pages=parallel,
+                    )
+                )
+
+            if repo_filter:
+                projects = [
+                    p
+                    for p in projects
+                    if (p.get("path_with_namespace") or p.get("path")) == repo_filter
+                    or ("/" not in repo_filter and (p.get("path") == repo_filter or p.get("name") == repo_filter))
+                    or str(p.get("id")) == repo_filter
+                ]
+
+            total_projects = len(projects)
+            if not projects:
+                console.print("[yellow]No projects found to scan.[/]")
+                raise typer.Exit(code=1)
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                transient=False,
+                console=console,
+            ) as progress:
+                task = progress.add_task("Listing open merge requests...", total=len(projects))
+                for project in projects:
+                    project_id = int(project.get("id") or 0)
+                    project_path = project.get("path_with_namespace") or project.get("path") or str(project_id)
+                    project_name = project.get("name")
+                    project_url = project.get("web_url")
+                    open_mrs_count = 0
+                    open_comments_total = 0
+                    open_comments_max = 0
+                    try:
+                        for mr in client.iter_project_merge_requests(
+                            project_id=project_id,
+                            state="opened",
+                            parallel_pages=parallel,
+                        ):
+                            total_mrs += 1
+                            open_mrs_count += 1
+                            comments = int(mr.get("user_notes_count") or 0)
+                            open_comments_total += comments
+                            if comments > open_comments_max:
+                                open_comments_max = comments
+                            if comments < min_comments:
+                                continue
+                            author = mr.get("author") or {}
+                            results.append(
+                                {
+                                    "project_id": project_id,
+                                    "project_path": project_path,
+                                    "mr_id": mr.get("id"),
+                                    "mr_iid": mr.get("iid"),
+                                    "title": mr.get("title"),
+                                    "state": mr.get("state"),
+                                    "web_url": mr.get("web_url"),
+                                    "author_username": author.get("username"),
+                                    "created_at": mr.get("created_at"),
+                                    "updated_at": mr.get("updated_at"),
+                                    "comments": comments,
+                                }
+                            )
+                    except GitLabAPIError as exc:
+                        errors.append({"project": project_path, "error": str(exc)})
+                        progress.advance(task, 1)
+                        continue
+                    if summary:
+                        avg_comments = round(open_comments_total / open_mrs_count, 2) if open_mrs_count else 0.0
+                        summary_rows.append(
+                            {
+                                "project_id": project_id,
+                                "project_name": project_name,
+                                "project_path": project_path,
+                                "project_url": project_url,
+                                "open_merge_requests": open_mrs_count,
+                                "open_comments": open_comments_total,
+                                "max_comments": open_comments_max,
+                                "avg_comments": avg_comments,
+                            }
+                        )
+                    progress.advance(task, 1)
+    except GitLabAPIError as exc:
+        console.print(f"[red]GitLab API error while listing merge requests:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:  # pragma: no cover - safety net
+        console.print(f"[red]Unexpected error while listing merge requests:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    results.sort(key=lambda item: int(item.get("comments") or 0), reverse=True)
+    if summary:
+        summary_rows.sort(key=lambda item: int(item.get("open_comments") or 0), reverse=True)
+
+    if not summary_only:
+        csv_path = run_root / "open_merge_requests.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            for mr in results:
+                writer.writerow(mr)
+
+    summary_path = run_root / "open_merge_requests.json"
+    with summary_path.open("w", encoding="utf-8") as fh:
+        payload = {
+            "root_group": root_group,
+            "all_top_groups": all_top_groups,
+            "top_groups": group_labels,
+            "repo_filter": repo_filter,
+            "min_comments": min_comments,
+            "count": len(results),
+            "total_projects": total_projects,
+            "total_open_mrs": total_mrs,
+            "errors": errors,
+        }
+        if summary:
+            payload["summary"] = summary_rows
+        if not summary_only:
+            payload["merge_requests"] = results
+        json.dump(
+            payload,
+            fh,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+
+    if summary:
+        summary_fields = [
+            "project_id",
+            "project_name",
+            "project_path",
+            "project_url",
+            "open_merge_requests",
+            "open_comments",
+            "max_comments",
+            "avg_comments",
+        ]
+        summary_csv = run_root / "open_merge_requests_summary.csv"
+        with summary_csv.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=summary_fields)
+            writer.writeheader()
+            for row in summary_rows:
+                writer.writerow(row)
+
+    console.print("\n[bold green]Open merge request listing complete.[/]")
+    console.print(f"Merge requests found: {len(results)} (>= {min_comments} comments)")
+    if summary:
+        console.print(f"Repositories summarized: {len(summary_rows)}")
+    if errors:
+        console.print(f"[yellow]MR listing errors: {len(errors)} (see open_merge_requests.json).[/]")
     console.print(f"[blue]Reports written to {run_root}[/]")
 
 
@@ -1054,6 +1993,26 @@ def find_large_files(
         "--include-subgroups/--no-include-subgroups",
         help="When using --group, include repositories from nested subgroups.",
     ),
+    mirror_root: Path | None = typer.Option(
+        None,
+        "--mirror-root",
+        help="Use local git mirror root; clone --mirror if missing and scan the mirror instead of API.",
+    ),
+    history: bool = typer.Option(
+        False,
+        "--history",
+        help="Scan all history reachable from each branch (mirror mode only).",
+    ),
+    default_branch_only: bool = typer.Option(
+        False,
+        "--default-branch",
+        help="Scan only the default branch (overrides --all-branches).",
+    ),
+    all_branches: bool = typer.Option(
+        False,
+        "--all-branches",
+        help="Scan all branches instead of just the default branch.",
+    ),
 ) -> None:
     """Scan a repository (or every repo in a group) for files larger than the given threshold (Git LFS candidates)."""
     if not token:
@@ -1062,6 +2021,14 @@ def find_large_files(
         raise typer.BadParameter("--threshold-mb must be positive")
     if not target and not repo_name:
         raise typer.BadParameter("Provide a repository/group via positional argument or --repo-name")
+    if default_branch_only and all_branches:
+        raise typer.BadParameter("--default-branch cannot be combined with --all-branches")
+    if history and not mirror_root:
+        raise typer.BadParameter("--history requires --mirror-root")
+
+    mirror_root_path: Path | None = None
+    if mirror_root:
+        mirror_root_path = Path(mirror_root).expanduser()
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     scope_dir = _safe_group_dir_name(target or repo_name or "unknown")
@@ -1074,6 +2041,8 @@ def find_large_files(
     skipped_projects: list[str] = []
     skipped_projects_errors: list[dict[str, str]] = []
     repo_filter = repo_name
+    group_mode = group
+    scan_all_branches = all_branches and not default_branch_only
 
     target = _normalize_ref(target)
     repo_name = _normalize_ref(repo_name)
@@ -1100,26 +2069,41 @@ def find_large_files(
     try:
         with GitLabClient(base_url=base_url, token=token) as client:
             if group:
-                grp = client.get_group(target or repo_name)
-                group_label = grp.get("full_path") or grp.get("path") or str(grp.get("id"))
-                console.print(
-                    f"[cyan]Scanning group[/] [bold]{group_label}[/] "
-                    f"for files >= {threshold_mb} MB (include_subgroups={include_subgroups})."
-                )
-                projects = list(client.iter_group_projects(int(grp["id"]), include_subgroups=include_subgroups))
-                if repo_name:
-                    repo_filter = repo_name
-                    projects = [
-                        p
-                        for p in projects
-                        if (p.get("path_with_namespace") or p.get("path")) == repo_filter
-                        or ("/" not in repo_filter and (p.get("path") == repo_filter or p.get("name") == repo_filter))
-                        or str(p.get("id")) == repo_filter
-                    ]
-                    if not projects:
-                        raise GitLabAPIError(
-                            f"Repository '{repo_filter}' not found in group {group_label} (or not accessible)"
-                        )
+                project_ref = repo_name
+                project: dict[str, object] | None = None
+                if target is None and project_ref and ("/" in project_ref or str(project_ref).isdigit()):
+                    try:
+                        project = client.get_project(project_ref, include_statistics=False)
+                    except GitLabAPIError as exc:
+                        if exc.status_code != 404:
+                            raise
+                if project:
+                    group_mode = False
+                    console.print(
+                        "[yellow]Repository reference provided; scanning single repository and ignoring --group.[/]"
+                    )
+                    projects = [project]
+                else:
+                    grp = client.get_group(target or repo_name)
+                    group_label = grp.get("full_path") or grp.get("path") or str(grp.get("id"))
+                    console.print(
+                        f"[cyan]Scanning group[/] [bold]{group_label}[/] "
+                        f"for files >= {threshold_mb} MB (include_subgroups={include_subgroups}, all_branches={scan_all_branches})."
+                    )
+                    projects = list(client.iter_group_projects(int(grp["id"]), include_subgroups=include_subgroups))
+                    if repo_name:
+                        repo_filter = repo_name
+                        projects = [
+                            p
+                            for p in projects
+                            if (p.get("path_with_namespace") or p.get("path")) == repo_filter
+                            or ("/" not in repo_filter and (p.get("path") == repo_filter or p.get("name") == repo_filter))
+                            or str(p.get("id")) == repo_filter
+                        ]
+                        if not projects:
+                            raise GitLabAPIError(
+                                f"Repository '{repo_filter}' not found in group {group_label} (or not accessible)"
+                            )
             else:
                 project_ref = repo_name or target
                 if project_ref and "/" not in project_ref and not str(project_ref).isdigit():
@@ -1142,37 +2126,134 @@ def find_large_files(
                 for project in projects:
                     project_id = int(project["id"])
                     project_path = project.get("path_with_namespace") or project.get("path") or str(project_id)
-                    default_branch = project.get("default_branch")
-                    if not default_branch:
-                        skipped_projects.append(project_path)
-                        progress.update(task, advance=1)
-                        continue
-                    scanned_projects.append(project_path)
-                    try:
-                        for entry in client.iter_project_tree(project_id=project_id, ref=default_branch, recursive=True):
-                            if entry.get("type") != "blob":
+                    if mirror_root_path:
+                        repo_url = project.get("http_url_to_repo") or project.get("ssh_url_to_repo")
+                        if not repo_url:
+                            repo_url = f"{base_url.rstrip('/')}/{project_path}.git"
+                        try:
+                            mirror_dir = _mirror_path_for_repo(mirror_root_path, repo_url)
+                            _ensure_mirror(mirror_dir, repo_url)
+                            branches = _get_mirror_branches(
+                                mirror_dir=mirror_dir,
+                                all_branches=scan_all_branches,
+                                default_branch=project.get("default_branch"),
+                            )
+                            if not branches:
+                                skipped_projects.append(project_path)
+                                progress.advance(task, 1)
                                 continue
-                            blob_sha = entry.get("id")
-                            if not blob_sha:
-                                continue
-                            blob = client.get_blob(project_id=project_id, blob_sha=blob_sha)
-                            size = int(blob.get("size") or 0)
-                            if size >= threshold_bytes:
-                                large_files.append(
-                                    LargeFileReport(
-                                        project_id=project_id,
-                                        project_path=project_path,
-                                        file_path=entry.get("path", ""),
-                                        size_bytes=size,
-                                        size_mb=round(size / (1024 * 1024), 2),
-                                        blob_sha=blob_sha,
+                            scanned_projects.append(project_path)
+                            for branch in branches:
+                                if history:
+                                    history_entries = _iter_large_blobs_in_history(
+                                        mirror_dir=mirror_dir,
+                                        branch=branch,
+                                        threshold_bytes=threshold_bytes,
                                     )
-                                )
-                    except GitLabAPIError as exc:
-                        skipped_projects_errors.append({"project": project_path, "error": str(exc)})
-                        console.print(
-                            f"[yellow]Warning:[/] skipping project {project_path} due to API error while walking tree: {exc}"
-                        )
+                                    for sha, size, path in history_entries:
+                                        large_files.append(
+                                            LargeFileReport(
+                                                project_id=project_id,
+                                                project_path=project_path,
+                                                branch=branch,
+                                                file_path=path,
+                                                size_bytes=size,
+                                                size_mb=round(size / (1024 * 1024), 2),
+                                                blob_sha=sha,
+                                            )
+                                        )
+                                else:
+                                    output = _run_git_command(
+                                        ["ls-tree", "-r", "-l", branch],
+                                        cwd=mirror_dir,
+                                    )
+                                    for line in output.splitlines():
+                                        match = re.match(
+                                            r"^(?P<mode>\S+)\s+(?P<type>\S+)\s+(?P<sha>\S+)\s+(?P<size>\d+)\t(?P<path>.+)$",
+                                            line,
+                                        )
+                                        if not match or match.group("type") != "blob":
+                                            continue
+                                        size = int(match.group("size"))
+                                        if size < threshold_bytes:
+                                            continue
+                                        large_files.append(
+                                            LargeFileReport(
+                                                project_id=project_id,
+                                                project_path=project_path,
+                                                branch=branch,
+                                                file_path=match.group("path"),
+                                                size_bytes=size,
+                                                size_mb=round(size / (1024 * 1024), 2),
+                                                blob_sha=match.group("sha"),
+                                            )
+                                        )
+                        except RuntimeError as exc:
+                            skipped_projects_errors.append(
+                                {"project": project_path, "error": str(exc), "source": "mirror"}
+                            )
+                        progress.advance(task, 1)
+                        continue
+                    blob_size_cache: dict[str, int] = {}
+                    if scan_all_branches:
+                        try:
+                            branches = [b.get("name") for b in client.iter_project_branches(project_id=project_id)]
+                        except GitLabAPIError as exc:
+                            skipped_projects_errors.append({"project": project_path, "error": str(exc)})
+                            console.print(
+                                f"[yellow]Warning:[/] skipping project {project_path} due to API error while listing branches: {exc}"
+                            )
+                            progress.advance(task, 1)
+                            continue
+                        branches = [b for b in branches if b]
+                        if not branches:
+                            skipped_projects.append(project_path)
+                            progress.advance(task, 1)
+                            continue
+                    else:
+                        default_branch = project.get("default_branch")
+                        if not default_branch:
+                            skipped_projects.append(project_path)
+                            progress.advance(task, 1)
+                            continue
+                        branches = [default_branch]
+
+                    scanned_projects.append(project_path)
+                    for branch in branches:
+                        try:
+                            for entry in client.iter_project_tree(
+                                project_id=project_id,
+                                ref=branch,
+                                recursive=True,
+                            ):
+                                if entry.get("type") != "blob":
+                                    continue
+                                blob_sha = entry.get("id")
+                                if not blob_sha:
+                                    continue
+                                if blob_sha in blob_size_cache:
+                                    size = blob_size_cache[blob_sha]
+                                else:
+                                    blob = client.get_blob(project_id=project_id, blob_sha=blob_sha)
+                                    size = int(blob.get("size") or 0)
+                                    blob_size_cache[blob_sha] = size
+                                if size >= threshold_bytes:
+                                    large_files.append(
+                                        LargeFileReport(
+                                            project_id=project_id,
+                                            project_path=project_path,
+                                            branch=branch,
+                                            file_path=entry.get("path", ""),
+                                            size_bytes=size,
+                                            size_mb=round(size / (1024 * 1024), 2),
+                                            blob_sha=blob_sha,
+                                        )
+                                    )
+                        except GitLabAPIError as exc:
+                            skipped_projects_errors.append({"project": project_path, "error": str(exc), "branch": branch})
+                            console.print(
+                                f"[yellow]Warning:[/] skipping branch {branch} in project {project_path} due to API error while walking tree: {exc}"
+                            )
                     progress.advance(task, 1)
     except GitLabAPIError as exc:
         console.print(f"[red]GitLab API error while scanning repository:[/] {exc}")
@@ -1185,7 +2266,7 @@ def find_large_files(
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(
             fh,
-            fieldnames=["project_id", "project_path", "file_path", "size_bytes", "size_mb", "blob_sha"],
+            fieldnames=["project_id", "project_path", "branch", "file_path", "size_bytes", "size_mb", "blob_sha"],
         )
         writer.writeheader()
         for lf in large_files:
@@ -1196,12 +2277,17 @@ def find_large_files(
         json.dump(
             {
                 "target": target or repo_name,
-                "group_mode": group,
+                "group_mode": group_mode,
+                "all_branches": scan_all_branches,
+                "default_branch_only": default_branch_only,
+                "history": history,
+                "mirror_root": str(mirror_root_path) if mirror_root_path else None,
                 "threshold_mb": threshold_mb,
                 "count": len(large_files),
                 "scanned_projects": scanned_projects,
                 "repo_filter": repo_filter,
-                "skipped_projects_no_default_branch": skipped_projects,
+                "skipped_projects_no_default_branch": [] if scan_all_branches else skipped_projects,
+                "skipped_projects_no_branches": skipped_projects if scan_all_branches else [],
                 "skipped_projects_errors": skipped_projects_errors,
                 "large_files": [asdict(lf) for lf in large_files],
             },
@@ -1211,14 +2297,16 @@ def find_large_files(
         )
 
     console.print("\n[bold green]Large file scan complete.[/]")
+    skipped_label = "without default branch" if not scan_all_branches else "without branches"
     console.print(
         f"Projects scanned: {len(scanned_projects)} "
-        f"(skipped {len(skipped_projects)} without default branch, {len(skipped_projects_errors)} with errors)"
+        f"(skipped {len(skipped_projects)} {skipped_label}, {len(skipped_projects_errors)} with errors)"
     )
     console.print(f"Files >= {threshold_mb} MB: {len(large_files)}")
     if large_files:
         for lf in large_files:
-            console.print(f"- {lf.file_path} ({lf.size_mb} MB)")
+            branch_label = lf.branch or "default"
+            console.print(f"- {branch_label}:{lf.file_path} ({lf.size_mb} MB)")
     console.print(f"[blue]Reports written to {run_root}[/]")
 
 

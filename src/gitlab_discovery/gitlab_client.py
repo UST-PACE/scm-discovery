@@ -186,12 +186,15 @@ class GitLabClient:
         self,
         group_id: int,
         include_subgroups: bool = False,
+        include_statistics: bool = False,
         parallel_pages: int | None = None,
     ) -> t.Iterator[dict[str, t.Any]]:
         params: dict[str, t.Any] = {
             "include_subgroups": include_subgroups,
             "with_shared": False,
         }
+        if include_statistics:
+            params["statistics"] = True
         return self._paginate(
             f"/groups/{group_id}/projects",
             params=params,
@@ -202,12 +205,15 @@ class GitLabClient:
         self,
         group_id: int,
         include_subgroups: bool = False,
+        include_statistics: bool = False,
         parallel_pages: int | None = None,
     ) -> t.Iterator[dict[str, t.Any]]:
         params: dict[str, t.Any] = {
             "include_subgroups": include_subgroups,
             "with_shared": False,
         }
+        if include_statistics:
+            params["statistics"] = True
         return self._paginate(
             f"/groups/{group_id}/projects",
             params=params,
@@ -337,6 +343,23 @@ class GitLabClient:
 
     def iter_project_tags(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
         return self._paginate(f"/projects/{project_id}/repository/tags")
+
+    def iter_project_merge_requests(
+        self,
+        project_id: int,
+        state: str = "opened",
+        parallel_pages: int | None = None,
+    ) -> t.Iterator[dict[str, t.Any]]:
+        params: dict[str, t.Any] = {
+            "state": state,
+            "order_by": "updated_at",
+            "sort": "desc",
+        }
+        return self._paginate(
+            f"/projects/{project_id}/merge_requests",
+            params=params,
+            parallel_pages=parallel_pages,
+        )
 
     def iter_project_branches(self, project_id: int) -> t.Iterator[dict[str, t.Any]]:
         return self._paginate(f"/projects/{project_id}/repository/branches")

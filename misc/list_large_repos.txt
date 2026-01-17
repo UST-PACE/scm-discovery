@@ -1,0 +1,3 @@
+export GITLAB_TOKEN="YOUR_TOKEN"
+export GITLAB_BASE_URL="https://gitlab.com"   # optional
+python3 list_large_repos.py --min-repo-mb 100 --size-field storage_size --out large_repos.csv
