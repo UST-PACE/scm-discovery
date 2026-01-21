@@ -60,6 +60,30 @@ def _normalize_ref(ref: str | None) -> str | None:
     return ref.strip()
 
 
+def _load_repo_inputs(repo_urls: list[str], repos_file: Path | None) -> list[tuple[str, str]]:
+    raw: list[str] = []
+    raw.extend(repo_urls)
+    if repos_file:
+        if not repos_file.exists():
+            raise typer.BadParameter(f"Repos file not found: {repos_file}")
+        for line in repos_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            raw.append(line)
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in raw:
+        normalized = _normalize_ref(item)
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        entries.append((item, normalized))
+        seen.add(normalized)
+    return entries
+
+
 def _mb_from_bytes(value: int | float | None) -> float | None:
     if value is None:
         return None
@@ -364,6 +388,248 @@ def list_repositories(
     console.print(f"Repositories found: {len(projects)}")
     for repo in projects:
         console.print(f"- {repo.get('path_with_namespace') or repo.get('path')} (id={repo.get('id')}, visibility={repo.get('visibility')})")
+    console.print(f"[blue]Reports written to {run_root}[/]")
+
+
+@app.command("list-repo-counts")
+def list_repo_counts(
+    repo_url: list[str] = typer.Option(
+        None,
+        "--repo-url",
+        help="GitLab repo URL or path (repeatable).",
+    ),
+    repos_file: Path | None = typer.Option(
+        None,
+        "--repos-file",
+        file_okay=True,
+        dir_okay=False,
+        help="Path to a file with one repo URL/path per line.",
+    ),
+    token: str = typer.Option(
+        None,
+        "--token",
+        envvar="GITLAB_TOKEN",
+        help="GitLab personal access token with read_api scope.",
+    ),
+    base_url: str = typer.Option(
+        "https://gitlab.com",
+        "--base-url",
+        envvar="GITLAB_BASE_URL",
+        help="GitLab base URL (defaults to gitlab.com). Can be set via GITLAB_BASE_URL.",
+    ),
+    output: Path = typer.Option(
+        Path("output"),
+        "--output",
+        "-o",
+        file_okay=False,
+        dir_okay=True,
+        envvar="OUTPUT_DIR",
+        help="Directory to write report CSV/JSON. Can be set via OUTPUT_DIR.",
+    ),
+    scan_large_files: bool = typer.Option(
+        False,
+        "--scan-large-files",
+        help="Check for large files via API (default branch only unless --all-branches).",
+    ),
+    large_file_threshold_mb: float = typer.Option(
+        100.0,
+        "--large-file-threshold-mb",
+        help="Large file threshold in MB when using --scan-large-files.",
+    ),
+    scan_all_branches: bool = typer.Option(
+        False,
+        "--all-branches",
+        help="When scanning large files, include all branches (API only, slower).",
+    ),
+    output_format: str = typer.Option(
+        "csv",
+        "--format",
+        help="Output format: csv or xlsx.",
+    ),
+) -> None:
+    """Report branch, tag, and open merge request counts for specific repositories."""
+    if not token:
+        raise typer.BadParameter("GitLab token is required via --token or env GITLAB_TOKEN")
+    repo_url = repo_url or []
+    repo_inputs = _load_repo_inputs(repo_url, repos_file)
+    if not repo_inputs:
+        raise typer.BadParameter("Provide --repo-url (repeatable) and/or --repos-file with at least one repo.")
+
+    output_format = output_format.strip().lower()
+    if output_format not in {"csv", "xlsx"}:
+        raise typer.BadParameter("--format must be either csv or xlsx")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    run_root = output / timestamp / "repo-counts"
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "input",
+        "project_id",
+        "path_with_namespace",
+        "web_url",
+        "branch_count",
+        "tag_count",
+        "open_mr_count",
+        "repository_size_mb",
+        "storage_size_mb",
+        "lfs_objects_size_mb",
+        "packages_size_mb",
+        "wiki_size_mb",
+        "job_artifacts_size_mb",
+        "large_file_count",
+        "large_file_max_mb",
+        "large_file_max_path",
+        "large_file_max_branch",
+        "error",
+    ]
+
+    results: list[dict[str, object]] = []
+    errors: list[dict[str, str]] = []
+    large_file_threshold_bytes = int(large_file_threshold_mb * 1024 * 1024)
+
+    try:
+        with GitLabClient(base_url=base_url, token=token) as client:
+            with Progress(SpinnerColumn(), TextColumn("{task.description}")) as progress:
+                task = progress.add_task("Collecting repo counts...", total=len(repo_inputs))
+                for raw, ref in repo_inputs:
+                    entry: dict[str, object] = {
+                        "input": raw,
+                        "project_id": None,
+                        "path_with_namespace": ref,
+                        "web_url": None,
+                        "branch_count": 0,
+                        "tag_count": 0,
+                        "open_mr_count": 0,
+                        "repository_size_mb": None,
+                        "storage_size_mb": None,
+                        "lfs_objects_size_mb": None,
+                        "packages_size_mb": None,
+                        "wiki_size_mb": None,
+                        "job_artifacts_size_mb": None,
+                        "large_file_count": 0,
+                        "large_file_max_mb": None,
+                        "large_file_max_path": None,
+                        "large_file_max_branch": None,
+                        "error": None,
+                    }
+                    try:
+                        project = client.get_project(ref, include_statistics=True)
+                        project_id = int(project.get("id") or 0)
+                        entry["project_id"] = project_id
+                        entry["path_with_namespace"] = project.get("path_with_namespace") or ref
+                        entry["web_url"] = project.get("web_url")
+                        stats = project.get("statistics") or {}
+                        entry["repository_size_mb"] = _mb_from_bytes(stats.get("repository_size"))
+                        entry["storage_size_mb"] = _mb_from_bytes(stats.get("storage_size"))
+                        entry["lfs_objects_size_mb"] = _mb_from_bytes(stats.get("lfs_objects_size"))
+                        entry["packages_size_mb"] = _mb_from_bytes(stats.get("packages_size"))
+                        entry["wiki_size_mb"] = _mb_from_bytes(stats.get("wiki_size"))
+                        entry["job_artifacts_size_mb"] = _mb_from_bytes(stats.get("job_artifacts_size"))
+                        entry["branch_count"] = client.get_list_total(
+                            f"/projects/{project_id}/repository/branches"
+                        )
+                        entry["tag_count"] = client.get_list_total(
+                            f"/projects/{project_id}/repository/tags"
+                        )
+                        entry["open_mr_count"] = client.get_list_total(
+                            f"/projects/{project_id}/merge_requests",
+                            params={"state": "opened"},
+                        )
+                        if scan_large_files:
+                            branches: list[str] = []
+                            if scan_all_branches:
+                                branches = [b.get("name") for b in client.iter_project_branches(project_id=project_id)]
+                                branches = [b for b in branches if b]
+                            else:
+                                default_branch = project.get("default_branch")
+                                if default_branch:
+                                    branches = [default_branch]
+                            if branches:
+                                blob_size_cache: dict[str, int] = {}
+                                seen_large_blobs: set[str] = set()
+                                max_size = 0
+                                max_path: str | None = None
+                                max_branch: str | None = None
+                                for branch in branches:
+                                    for node in client.iter_project_tree(
+                                        project_id=project_id,
+                                        ref=branch,
+                                        recursive=True,
+                                    ):
+                                        if node.get("type") != "blob":
+                                            continue
+                                        blob_sha = node.get("id")
+                                        if not blob_sha:
+                                            continue
+                                        if blob_sha in blob_size_cache:
+                                            size = blob_size_cache[blob_sha]
+                                        else:
+                                            blob = client.get_blob(project_id=project_id, blob_sha=blob_sha)
+                                            size = int(blob.get("size") or 0)
+                                            blob_size_cache[blob_sha] = size
+                                        if size >= large_file_threshold_bytes:
+                                            seen_large_blobs.add(blob_sha)
+                                            if size > max_size:
+                                                max_size = size
+                                                max_path = node.get("path")
+                                                max_branch = branch
+                                entry["large_file_count"] = len(seen_large_blobs)
+                                entry["large_file_max_mb"] = _mb_from_bytes(max_size) if max_size else None
+                                entry["large_file_max_path"] = max_path
+                                entry["large_file_max_branch"] = max_branch
+                    except GitLabAPIError as exc:
+                        entry["error"] = str(exc)
+                        errors.append({"input": raw, "error": str(exc)})
+                    results.append(entry)
+                    progress.advance(task, 1)
+    except GitLabAPIError as exc:
+        console.print(f"[red]GitLab API error while listing repo counts:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:  # pragma: no cover - safety net
+        console.print(f"[red]Unexpected error while listing repo counts:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    csv_path = run_root / "repo_counts.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in results:
+            writer.writerow(row)
+
+    xlsx_path: Path | None = None
+    if output_format == "xlsx":
+        try:
+            from openpyxl import Workbook
+        except ImportError as exc:
+            raise typer.BadParameter("XLSX output requires openpyxl (pip install openpyxl).") from exc
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "repo_counts"
+        ws.append(fieldnames)
+        for row in results:
+            ws.append([row.get(field) for field in fieldnames])
+        xlsx_path = run_root / "repo_counts.xlsx"
+        wb.save(xlsx_path)
+
+    summary_path = run_root / "repo_counts.json"
+    with summary_path.open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "count": len(results),
+                "errors": errors,
+                "repositories": results,
+            },
+            fh,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+
+    console.print("\n[bold green]Repository count listing complete.[/]")
+    console.print(f"Repositories processed: {len(results)} (errors: {len(errors)})")
+    if xlsx_path:
+        console.print(f"[blue]XLSX written to {xlsx_path}[/]")
     console.print(f"[blue]Reports written to {run_root}[/]")
 
 
