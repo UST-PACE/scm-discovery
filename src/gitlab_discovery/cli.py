@@ -9,6 +9,8 @@ import csv
 import json
 import re
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from urllib.parse import urlparse
 from collections import defaultdict
@@ -90,6 +92,23 @@ def _mb_from_bytes(value: int | float | None) -> float | None:
     try:
         return round(float(value) / (1024 * 1024), 2)
     except (TypeError, ValueError):
+        return None
+
+
+def _parse_gitlab_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
         return None
 
 
@@ -426,6 +445,12 @@ def list_repo_counts(
         envvar="OUTPUT_DIR",
         help="Directory to write report CSV/JSON. Can be set via OUTPUT_DIR.",
     ),
+    parallel_workers: int = typer.Option(
+        1,
+        "--parallel-workers",
+        envvar="GITLAB_DISCOVERY_PARALLEL_WORKERS",
+        help="Number of repositories to process concurrently (>=1).",
+    ),
     scan_large_files: bool = typer.Option(
         False,
         "--scan-large-files",
@@ -441,6 +466,21 @@ def list_repo_counts(
         "--all-branches",
         help="When scanning large files, include all branches (API only, slower).",
     ),
+    active_open_pr_days: int | None = typer.Option(
+        None,
+        "--active-open-pr-days",
+        help="Count open merge requests updated within the last N days.",
+    ),
+    active_branch_days: int | None = typer.Option(
+        None,
+        "--active-branch-days",
+        help="Count branches with commits in the last N days.",
+    ),
+    active_tag_days: int | None = typer.Option(
+        None,
+        "--active-tag-days",
+        help="Count tags pointing to commits in the last N days.",
+    ),
     output_format: str = typer.Option(
         "csv",
         "--format",
@@ -450,6 +490,8 @@ def list_repo_counts(
     """Report branch, tag, and open merge request counts for specific repositories."""
     if not token:
         raise typer.BadParameter("GitLab token is required via --token or env GITLAB_TOKEN")
+    if parallel_workers < 1:
+        raise typer.BadParameter("--parallel-workers must be >= 1")
     repo_url = repo_url or []
     repo_inputs = _load_repo_inputs(repo_url, repos_file)
     if not repo_inputs:
@@ -477,6 +519,9 @@ def list_repo_counts(
         "packages_size_mb",
         "wiki_size_mb",
         "job_artifacts_size_mb",
+        "active_open_mr_count",
+        "active_branch_count",
+        "active_tag_count",
         "large_file_count",
         "large_file_max_mb",
         "large_file_max_path",
@@ -487,108 +532,185 @@ def list_repo_counts(
     results: list[dict[str, object]] = []
     errors: list[dict[str, str]] = []
     large_file_threshold_bytes = int(large_file_threshold_mb * 1024 * 1024)
+    now = datetime.now(timezone.utc)
+    active_open_cutoff = (
+        now - timedelta(days=active_open_pr_days) if active_open_pr_days is not None else None
+    )
+    active_branch_cutoff = (
+        now - timedelta(days=active_branch_days) if active_branch_days is not None else None
+    )
+    active_tag_cutoff = (
+        now - timedelta(days=active_tag_days) if active_tag_days is not None else None
+    )
+    local_state = threading.local()
+    client_lock = threading.Lock()
+    clients: list[GitLabClient] = []
+
+    def _get_client() -> GitLabClient:
+        client = getattr(local_state, "client", None)
+        if client is None:
+            client = GitLabClient(base_url=base_url, token=token)
+            with client_lock:
+                clients.append(client)
+            local_state.client = client
+        return client
+
+    def _collect_repo_counts(raw: str, ref: str) -> dict[str, object]:
+        entry: dict[str, object] = {
+            "input": raw,
+            "project_id": None,
+            "path_with_namespace": ref,
+            "web_url": None,
+            "branch_count": 0,
+            "tag_count": 0,
+            "open_mr_count": 0,
+            "repository_size_mb": None,
+            "storage_size_mb": None,
+            "lfs_objects_size_mb": None,
+            "packages_size_mb": None,
+            "wiki_size_mb": None,
+            "job_artifacts_size_mb": None,
+            "active_open_mr_count": None,
+            "active_branch_count": None,
+            "active_tag_count": None,
+            "large_file_count": 0,
+            "large_file_max_mb": None,
+            "large_file_max_path": None,
+            "large_file_max_branch": None,
+            "error": None,
+        }
+        try:
+            client = _get_client()
+            project = client.get_project(ref, include_statistics=True)
+            project_id = int(project.get("id") or 0)
+            entry["project_id"] = project_id
+            entry["path_with_namespace"] = project.get("path_with_namespace") or ref
+            entry["web_url"] = project.get("web_url")
+            stats = project.get("statistics") or {}
+            entry["repository_size_mb"] = _mb_from_bytes(stats.get("repository_size"))
+            entry["storage_size_mb"] = _mb_from_bytes(stats.get("storage_size"))
+            entry["lfs_objects_size_mb"] = _mb_from_bytes(stats.get("lfs_objects_size"))
+            entry["packages_size_mb"] = _mb_from_bytes(stats.get("packages_size"))
+            entry["wiki_size_mb"] = _mb_from_bytes(stats.get("wiki_size"))
+            entry["job_artifacts_size_mb"] = _mb_from_bytes(stats.get("job_artifacts_size"))
+            entry["branch_count"] = client.get_list_total(
+                f"/projects/{project_id}/repository/branches"
+            )
+            entry["tag_count"] = client.get_list_total(
+                f"/projects/{project_id}/repository/tags"
+            )
+            entry["open_mr_count"] = client.get_list_total(
+                f"/projects/{project_id}/merge_requests",
+                params={"state": "opened"},
+            )
+            if active_branch_cutoff is not None:
+                active_branches = 0
+                for branch in client.iter_project_branches(project_id=project_id):
+                    commit = branch.get("commit") or {}
+                    commit_date = _parse_gitlab_timestamp(
+                        commit.get("committed_date") or commit.get("authored_date")
+                    )
+                    if commit_date and commit_date >= active_branch_cutoff:
+                        active_branches += 1
+                entry["active_branch_count"] = active_branches
+            if active_tag_cutoff is not None:
+                active_tags = 0
+                for tag in client.iter_project_tags(project_id=project_id):
+                    commit = tag.get("commit") or {}
+                    commit_date = _parse_gitlab_timestamp(
+                        commit.get("committed_date") or commit.get("authored_date")
+                    )
+                    if commit_date and commit_date >= active_tag_cutoff:
+                        active_tags += 1
+                entry["active_tag_count"] = active_tags
+            if active_open_cutoff is not None:
+                active_open = 0
+                for mr in client.iter_project_merge_requests(
+                    project_id=project_id,
+                    state="opened",
+                ):
+                    updated = _parse_gitlab_timestamp(mr.get("updated_at"))
+                    if updated and updated >= active_open_cutoff:
+                        active_open += 1
+                entry["active_open_mr_count"] = active_open
+            if scan_large_files:
+                branches: list[str] = []
+                if scan_all_branches:
+                    branches = [b.get("name") for b in client.iter_project_branches(project_id=project_id)]
+                    branches = [b for b in branches if b]
+                else:
+                    default_branch = project.get("default_branch")
+                    if default_branch:
+                        branches = [default_branch]
+                if branches:
+                    blob_size_cache: dict[str, int] = {}
+                    seen_large_blobs: set[str] = set()
+                    max_size = 0
+                    max_path: str | None = None
+                    max_branch: str | None = None
+                    for branch in branches:
+                        for node in client.iter_project_tree(
+                            project_id=project_id,
+                            ref=branch,
+                            recursive=True,
+                        ):
+                            if node.get("type") != "blob":
+                                continue
+                            blob_sha = node.get("id")
+                            if not blob_sha:
+                                continue
+                            if blob_sha in blob_size_cache:
+                                size = blob_size_cache[blob_sha]
+                            else:
+                                blob = client.get_blob(project_id=project_id, blob_sha=blob_sha)
+                                size = int(blob.get("size") or 0)
+                                blob_size_cache[blob_sha] = size
+                            if size >= large_file_threshold_bytes:
+                                seen_large_blobs.add(blob_sha)
+                                if size > max_size:
+                                    max_size = size
+                                    max_path = node.get("path")
+                                    max_branch = branch
+                    entry["large_file_count"] = len(seen_large_blobs)
+                    entry["large_file_max_mb"] = _mb_from_bytes(max_size) if max_size else None
+                    entry["large_file_max_path"] = max_path
+                    entry["large_file_max_branch"] = max_branch
+        except GitLabAPIError as exc:
+            entry["error"] = str(exc)
+        return entry
 
     try:
-        with GitLabClient(base_url=base_url, token=token) as client:
-            with Progress(SpinnerColumn(), TextColumn("{task.description}")) as progress:
-                task = progress.add_task("Collecting repo counts...", total=len(repo_inputs))
+        with Progress(SpinnerColumn(), TextColumn("{task.description}")) as progress:
+            task = progress.add_task("Collecting repo counts...", total=len(repo_inputs))
+            if parallel_workers == 1:
                 for raw, ref in repo_inputs:
-                    entry: dict[str, object] = {
-                        "input": raw,
-                        "project_id": None,
-                        "path_with_namespace": ref,
-                        "web_url": None,
-                        "branch_count": 0,
-                        "tag_count": 0,
-                        "open_mr_count": 0,
-                        "repository_size_mb": None,
-                        "storage_size_mb": None,
-                        "lfs_objects_size_mb": None,
-                        "packages_size_mb": None,
-                        "wiki_size_mb": None,
-                        "job_artifacts_size_mb": None,
-                        "large_file_count": 0,
-                        "large_file_max_mb": None,
-                        "large_file_max_path": None,
-                        "large_file_max_branch": None,
-                        "error": None,
-                    }
-                    try:
-                        project = client.get_project(ref, include_statistics=True)
-                        project_id = int(project.get("id") or 0)
-                        entry["project_id"] = project_id
-                        entry["path_with_namespace"] = project.get("path_with_namespace") or ref
-                        entry["web_url"] = project.get("web_url")
-                        stats = project.get("statistics") or {}
-                        entry["repository_size_mb"] = _mb_from_bytes(stats.get("repository_size"))
-                        entry["storage_size_mb"] = _mb_from_bytes(stats.get("storage_size"))
-                        entry["lfs_objects_size_mb"] = _mb_from_bytes(stats.get("lfs_objects_size"))
-                        entry["packages_size_mb"] = _mb_from_bytes(stats.get("packages_size"))
-                        entry["wiki_size_mb"] = _mb_from_bytes(stats.get("wiki_size"))
-                        entry["job_artifacts_size_mb"] = _mb_from_bytes(stats.get("job_artifacts_size"))
-                        entry["branch_count"] = client.get_list_total(
-                            f"/projects/{project_id}/repository/branches"
-                        )
-                        entry["tag_count"] = client.get_list_total(
-                            f"/projects/{project_id}/repository/tags"
-                        )
-                        entry["open_mr_count"] = client.get_list_total(
-                            f"/projects/{project_id}/merge_requests",
-                            params={"state": "opened"},
-                        )
-                        if scan_large_files:
-                            branches: list[str] = []
-                            if scan_all_branches:
-                                branches = [b.get("name") for b in client.iter_project_branches(project_id=project_id)]
-                                branches = [b for b in branches if b]
-                            else:
-                                default_branch = project.get("default_branch")
-                                if default_branch:
-                                    branches = [default_branch]
-                            if branches:
-                                blob_size_cache: dict[str, int] = {}
-                                seen_large_blobs: set[str] = set()
-                                max_size = 0
-                                max_path: str | None = None
-                                max_branch: str | None = None
-                                for branch in branches:
-                                    for node in client.iter_project_tree(
-                                        project_id=project_id,
-                                        ref=branch,
-                                        recursive=True,
-                                    ):
-                                        if node.get("type") != "blob":
-                                            continue
-                                        blob_sha = node.get("id")
-                                        if not blob_sha:
-                                            continue
-                                        if blob_sha in blob_size_cache:
-                                            size = blob_size_cache[blob_sha]
-                                        else:
-                                            blob = client.get_blob(project_id=project_id, blob_sha=blob_sha)
-                                            size = int(blob.get("size") or 0)
-                                            blob_size_cache[blob_sha] = size
-                                        if size >= large_file_threshold_bytes:
-                                            seen_large_blobs.add(blob_sha)
-                                            if size > max_size:
-                                                max_size = size
-                                                max_path = node.get("path")
-                                                max_branch = branch
-                                entry["large_file_count"] = len(seen_large_blobs)
-                                entry["large_file_max_mb"] = _mb_from_bytes(max_size) if max_size else None
-                                entry["large_file_max_path"] = max_path
-                                entry["large_file_max_branch"] = max_branch
-                    except GitLabAPIError as exc:
-                        entry["error"] = str(exc)
-                        errors.append({"input": raw, "error": str(exc)})
+                    entry = _collect_repo_counts(raw, ref)
+                    if entry.get("error"):
+                        errors.append({"input": raw, "error": str(entry["error"])})
                     results.append(entry)
                     progress.advance(task, 1)
+            else:
+                with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+                    future_map = {
+                        executor.submit(_collect_repo_counts, raw, ref): (raw, ref)
+                        for raw, ref in repo_inputs
+                    }
+                    for future in as_completed(future_map):
+                        raw, _ref = future_map[future]
+                        entry = future.result()
+                        if entry.get("error"):
+                            errors.append({"input": raw, "error": str(entry["error"])})
+                        results.append(entry)
+                        progress.advance(task, 1)
     except GitLabAPIError as exc:
         console.print(f"[red]GitLab API error while listing repo counts:[/] {exc}")
         raise typer.Exit(code=1) from exc
     except Exception as exc:  # pragma: no cover - safety net
         console.print(f"[red]Unexpected error while listing repo counts:[/] {exc}")
         raise typer.Exit(code=1) from exc
+    finally:
+        for client in clients:
+            client.close()
 
     csv_path = run_root / "repo_counts.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
